@@ -16,19 +16,22 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.csv
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.Path
 
-import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.csv.CSVOptions
-import org.apache.spark.sql.catalyst.expressions.ExprUtils
+import org.apache.spark.sql.catalyst.expressions.{Expression, ExprUtils}
+import org.apache.spark.sql.connector.read.PartitionReaderFactory
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.PartitioningAwareFileIndex
 import org.apache.spark.sql.execution.datasources.csv.CSVDataSource
 import org.apache.spark.sql.execution.datasources.v2.TextBasedFileScan
-import org.apache.spark.sql.sources.v2.reader.PartitionReaderFactory
-import org.apache.spark.sql.types.{DataType, StructType}
+import org.apache.spark.sql.sources.Filter
+import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.SerializableConfiguration
 
 case class CSVScan(
@@ -37,17 +40,30 @@ case class CSVScan(
     dataSchema: StructType,
     readDataSchema: StructType,
     readPartitionSchema: StructType,
-    options: CaseInsensitiveStringMap)
-  extends TextBasedFileScan(sparkSession, fileIndex, readDataSchema, readPartitionSchema, options) {
+    options: CaseInsensitiveStringMap,
+    pushedFilters: Array[Filter],
+    partitionFilters: Seq[Expression] = Seq.empty,
+    dataFilters: Seq[Expression] = Seq.empty)
+  extends TextBasedFileScan(sparkSession, options) {
 
+  val columnPruning = sparkSession.sessionState.conf.csvColumnPruning
   private lazy val parsedOptions: CSVOptions = new CSVOptions(
     options.asScala.toMap,
-    columnPruning = sparkSession.sessionState.conf.csvColumnPruning,
+    columnPruning = columnPruning,
     sparkSession.sessionState.conf.sessionLocalTimeZone,
     sparkSession.sessionState.conf.columnNameOfCorruptRecord)
 
   override def isSplitable(path: Path): Boolean = {
     CSVDataSource(parsedOptions).isSplitable && super.isSplitable(path)
+  }
+
+  override def getFileUnSplittableReason(path: Path): String = {
+    assert(!isSplitable(path))
+    if (!super.isSplitable(path)) {
+      super.getFileUnSplittableReason(path)
+    } else {
+      "the csv datasource is set multiLine mode"
+    }
   }
 
   override def createReaderFactory(): PartitionReaderFactory = {
@@ -56,17 +72,13 @@ case class CSVScan(
 
     if (readDataSchema.length == 1 &&
       readDataSchema.head.name == parsedOptions.columnNameOfCorruptRecord) {
-      throw new AnalysisException(
-        "Since Spark 2.3, the queries from raw JSON/CSV files are disallowed when the\n" +
-          "referenced columns only include the internal corrupt record column\n" +
-          "(named _corrupt_record by default). For example:\n" +
-          "spark.read.schema(schema).csv(file).filter($\"_corrupt_record\".isNotNull).count()\n" +
-          "and spark.read.schema(schema).csv(file).select(\"_corrupt_record\").show().\n" +
-          "Instead, you can cache or save the parsed results and then send the same query.\n" +
-          "For example, val df = spark.read.schema(schema).csv(file).cache() and then\n" +
-          "df.filter($\"_corrupt_record\".isNotNull).count()."
-      )
+      throw QueryCompilationErrors.queryFromRawFilesIncludeCorruptRecordColumnError()
     }
+
+    // Don't push any filter which refers to the "virtual" column which cannot present in the input.
+    // Such filters will be applied later on the upper layer.
+    val actualFilters =
+      pushedFilters.filterNot(_.references.contains(parsedOptions.columnNameOfCorruptRecord))
 
     val caseSensitiveMap = options.asCaseSensitiveMap.asScala.toMap
     // Hadoop Configurations are case sensitive.
@@ -76,6 +88,19 @@ case class CSVScan(
     // The partition values are already truncated in `FileScan.partitions`.
     // We should use `readPartitionSchema` as the partition schema here.
     CSVPartitionReaderFactory(sparkSession.sessionState.conf, broadcastedConf,
-      dataSchema, readDataSchema, readPartitionSchema, parsedOptions)
+      dataSchema, readDataSchema, readPartitionSchema, parsedOptions,
+      actualFilters.toImmutableArraySeq)
+  }
+
+  override def equals(obj: Any): Boolean = obj match {
+    case c: CSVScan => super.equals(c) && dataSchema == c.dataSchema && options == c.options &&
+      equivalentFilters(pushedFilters, c.pushedFilters)
+    case _ => false
+  }
+
+  override def hashCode(): Int = super.hashCode()
+
+  override def getMetaData(): Map[String, String] = {
+    super.getMetaData() ++ Map("PushedFilters" -> seqToString(pushedFilters.toImmutableArraySeq))
   }
 }

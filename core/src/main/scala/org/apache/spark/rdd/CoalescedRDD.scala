@@ -24,6 +24,7 @@ import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
 import org.apache.spark._
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 /**
@@ -38,12 +39,12 @@ private[spark] case class CoalescedRDDPartition(
     @transient rdd: RDD[_],
     parentsIndices: Array[Int],
     @transient preferredLocation: Option[String] = None) extends Partition {
-  var parents: Seq[Partition] = parentsIndices.map(rdd.partitions(_))
+  var parents: Seq[Partition] = parentsIndices.map(rdd.partitions(_)).toImmutableArraySeq
 
   @throws(classOf[IOException])
   private def writeObject(oos: ObjectOutputStream): Unit = Utils.tryOrIOException {
     // Update the reference to parent partition at the time of task serialization
-    parents = parentsIndices.map(rdd.partitions(_))
+    parents = parentsIndices.map(rdd.partitions(_)).toImmutableArraySeq
     oos.defaultWriteObject()
   }
 
@@ -103,11 +104,11 @@ private[spark] class CoalescedRDD[T: ClassTag](
   override def getDependencies: Seq[Dependency[_]] = {
     Seq(new NarrowDependency(prev) {
       def getParents(id: Int): Seq[Int] =
-        partitions(id).asInstanceOf[CoalescedRDDPartition].parentsIndices
+        partitions(id).asInstanceOf[CoalescedRDDPartition].parentsIndices.toImmutableArraySeq
     })
   }
 
-  override def clearDependencies() {
+  override def clearDependencies(): Unit = {
     super.clearDependencies()
     prev = null
   }
@@ -239,7 +240,7 @@ private class DefaultPartitionCoalescer(val balanceSlack: Double = 0.10)
    * locations (2 * n log(n))
    * @param targetLen The number of desired partition groups
    */
-  def setupGroups(targetLen: Int, partitionLocs: PartitionLocations) {
+  def setupGroups(targetLen: Int, partitionLocs: PartitionLocations): Unit = {
     // deal with empty case, just create targetLen partition groups with no preferred location
     if (partitionLocs.partsWithLocs.isEmpty) {
       (1 to targetLen).foreach(_ => groupArr += new PartitionGroup())
@@ -328,7 +329,7 @@ private class DefaultPartitionCoalescer(val balanceSlack: Double = 0.10)
   def throwBalls(
       maxPartitions: Int,
       prev: RDD[_],
-      balanceSlack: Double, partitionLocs: PartitionLocations) {
+      balanceSlack: Double, partitionLocs: PartitionLocations): Unit = {
     if (noLocality) {  // no preferredLocations in parent RDD, no randomization needed
       if (maxPartitions > groupArr.size) { // just return prev.partitions
         for ((p, i) <- prev.partitions.zipWithIndex) {
@@ -351,7 +352,7 @@ private class DefaultPartitionCoalescer(val balanceSlack: Double = 0.10)
       val partIter = partitionLocs.partsWithLocs.iterator
       groupArr.filter(pg => pg.numPartitions == 0).foreach { pg =>
         while (partIter.hasNext && pg.numPartitions == 0) {
-          var (_, nxt_part) = partIter.next()
+          val (_, nxt_part) = partIter.next()
           if (!initialHash.contains(nxt_part)) {
             pg.partitions += nxt_part
             initialHash += nxt_part
@@ -364,7 +365,7 @@ private class DefaultPartitionCoalescer(val balanceSlack: Double = 0.10)
       val partNoLocIter = partitionLocs.partsWithoutLocs.iterator
       groupArr.filter(pg => pg.numPartitions == 0).foreach { pg =>
         while (partNoLocIter.hasNext && pg.numPartitions == 0) {
-          var nxt_part = partNoLocIter.next()
+          val nxt_part = partNoLocIter.next()
           if (!initialHash.contains(nxt_part)) {
             pg.partitions += nxt_part
             initialHash += nxt_part

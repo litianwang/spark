@@ -8,9 +8,9 @@ license: |
   The ASF licenses this file to You under the Apache License, Version 2.0
   (the "License"); you may not use this file except in compliance with
   the License.  You may obtain a copy of the License at
- 
+
      http://www.apache.org/licenses/LICENSE-2.0
- 
+
   Unless required by applicable law or agreed to in writing, software
   distributed under the License is distributed on an "AS IS" BASIS,
   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -35,7 +35,8 @@ script as shown here while passing your jar.
 
 For Python, you can use the `--py-files` argument of `spark-submit` to add `.py`, `.zip` or `.egg`
 files to be distributed with your application. If you depend on multiple Python files we recommend
-packaging them into a `.zip` or `.egg`.
+packaging them into a `.zip` or `.egg`. For third-party Python dependencies,
+see [Python Package Management](api/python/user_guide/python_packaging.html).
 
 # Launching Applications with spark-submit
 
@@ -76,7 +77,7 @@ locally on your laptop), it is common to use `cluster` mode to minimize network 
 the drivers and the executors. Currently, the standalone mode does not support cluster mode for Python
 applications.
 
-For Python applications, simply pass a `.py` file in the place of `<application-jar>` instead of a JAR,
+For Python applications, simply pass a `.py` file in the place of `<application-jar>`,
 and add Python `.zip`, `.egg` or `.py` files to the search path with `--py-files`.
 
 There are a few options available that are specific to the
@@ -90,7 +91,7 @@ run it with `--help`. Here are a few examples of common options:
 # Run application locally on 8 cores
 ./bin/spark-submit \
   --class org.apache.spark.examples.SparkPi \
-  --master local[8] \
+  --master "local[8]" \
   /path/to/examples.jar \
   100
 
@@ -114,12 +115,12 @@ run it with `--help`. Here are a few examples of common options:
   /path/to/examples.jar \
   1000
 
-# Run on a YARN cluster
+# Run on a YARN cluster in cluster deploy mode
 export HADOOP_CONF_DIR=XXX
 ./bin/spark-submit \
   --class org.apache.spark.examples.SparkPi \
   --master yarn \
-  --deploy-mode cluster \  # can be client for client mode
+  --deploy-mode cluster \
   --executor-memory 20G \
   --num-executors 50 \
   /path/to/examples.jar \
@@ -129,17 +130,6 @@ export HADOOP_CONF_DIR=XXX
 ./bin/spark-submit \
   --master spark://207.184.161.138:7077 \
   examples/src/main/python/pi.py \
-  1000
-
-# Run on a Mesos cluster in cluster deploy mode with supervise
-./bin/spark-submit \
-  --class org.apache.spark.examples.SparkPi \
-  --master mesos://207.184.161.138:7077 \
-  --deploy-mode cluster \
-  --supervise \
-  --executor-memory 20G \
-  --total-executor-cores 100 \
-  http://path/to/examples.jar \
   1000
 
 # Run on a Kubernetes cluster in cluster deploy mode
@@ -158,31 +148,27 @@ export HADOOP_CONF_DIR=XXX
 
 The master URL passed to Spark can be in one of the following formats:
 
-<table class="table">
-<tr><th>Master URL</th><th>Meaning</th></tr>
+<table>
+<thead><tr><th>Master URL</th><th>Meaning</th></tr></thead>
 <tr><td> <code>local</code> </td><td> Run Spark locally with one worker thread (i.e. no parallelism at all). </td></tr>
 <tr><td> <code>local[K]</code> </td><td> Run Spark locally with K worker threads (ideally, set this to the number of cores on your machine). </td></tr>
-<tr><td> <code>local[K,F]</code> </td><td> Run Spark locally with K worker threads and F maxFailures (see <a href="configuration.html#scheduling">spark.task.maxFailures</a> for an explanation of this variable) </td></tr>
+<tr><td> <code>local[K,F]</code> </td><td> Run Spark locally with K worker threads and F maxFailures (see <a href="configuration.html#scheduling">spark.task.maxFailures</a> for an explanation of this variable). </td></tr>
 <tr><td> <code>local[*]</code> </td><td> Run Spark locally with as many worker threads as logical cores on your machine.</td></tr>
 <tr><td> <code>local[*,F]</code> </td><td> Run Spark locally with as many worker threads as logical cores on your machine and F maxFailures.</td></tr>
+<tr><td> <code>local-cluster[N,C,M]</code> </td><td> Local-cluster mode is only for unit tests. It emulates a distributed cluster in a single JVM with N number of workers, C cores per worker and M MiB of memory per worker.</td></tr>
 <tr><td> <code>spark://HOST:PORT</code> </td><td> Connect to the given <a href="spark-standalone.html">Spark standalone
         cluster</a> master. The port must be whichever one your master is configured to use, which is 7077 by default.
 </td></tr>
 <tr><td> <code>spark://HOST1:PORT1,HOST2:PORT2</code> </td><td> Connect to the given <a href="spark-standalone.html#standby-masters-with-zookeeper">Spark standalone
         cluster with standby masters with Zookeeper</a>. The list must have all the master hosts in the high availability cluster set up with Zookeeper. The port must be whichever each master is configured to use, which is 7077 by default.
 </td></tr>
-<tr><td> <code>mesos://HOST:PORT</code> </td><td> Connect to the given <a href="running-on-mesos.html">Mesos</a> cluster.
-        The port must be whichever one your is configured to use, which is 5050 by default.
-        Or, for a Mesos cluster using ZooKeeper, use <code>mesos://zk://...</code>.
-        To submit with <code>--deploy-mode cluster</code>, the HOST:PORT should be configured to connect to the <a href="running-on-mesos.html#cluster-mode">MesosClusterDispatcher</a>.
-</td></tr>
 <tr><td> <code>yarn</code> </td><td> Connect to a <a href="running-on-yarn.html"> YARN </a> cluster in
         <code>client</code> or <code>cluster</code> mode depending on the value of <code>--deploy-mode</code>.
         The cluster location will be found based on the <code>HADOOP_CONF_DIR</code> or <code>YARN_CONF_DIR</code> variable.
 </td></tr>
 <tr><td> <code>k8s://HOST:PORT</code> </td><td> Connect to a <a href="running-on-kubernetes.html">Kubernetes</a> cluster in
-        <code>cluster</code> mode. Client mode is currently unsupported and will be supported in future releases.
-        The <code>HOST</code> and <code>PORT</code> refer to the [Kubernetes API Server](https://kubernetes.io/docs/reference/generated/kube-apiserver/).
+        <code>client</code> or <code>cluster</code> mode depending on the value of <code>--deploy-mode</code>.
+        The <code>HOST</code> and <code>PORT</code> refer to the <a href="https://kubernetes.io/docs/reference/generated/kube-apiserver/">Kubernetes API Server</a>.
         It connects using TLS by default. In order to force it to use an unsecured connection, you can use
         <code>k8s://http://HOST:PORT</code>.
 </td></tr>
@@ -192,9 +178,13 @@ The master URL passed to Spark can be in one of the following formats:
 # Loading Configuration from a File
 
 The `spark-submit` script can load default [Spark configuration values](configuration.html) from a
-properties file and pass them on to your application. By default, it will read options
-from `conf/spark-defaults.conf` in the Spark directory. For more detail, see the section on
-[loading default configurations](configuration.html#loading-default-configurations).
+properties file and pass them on to your application. The file can be specified via the `--properties-file`
+parameter. When this is not specified, by default Spark will read options from `conf/spark-defaults.conf`
+in the `SPARK_HOME` directory.
+
+An additional flag `--load-spark-defaults` can be used to tell Spark to load configurations from `conf/spark-defaults.conf`
+even when a property file is provided via `--properties-file`. This is useful, for instance, when users
+want to put system-wide default settings in the former while user/cluster specific settings in the latter.
 
 Loading default Spark configurations this way can obviate the need for certain flags to
 `spark-submit`. For instance, if the `spark.master` property is set, you can safely omit the

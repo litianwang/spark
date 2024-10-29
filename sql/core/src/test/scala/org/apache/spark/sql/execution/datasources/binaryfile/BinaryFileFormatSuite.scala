@@ -21,24 +21,24 @@ import java.io.{File, IOException}
 import java.nio.file.{Files, StandardOpenOption}
 import java.sql.Timestamp
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import com.google.common.io.{ByteStreams, Closeables}
 import org.apache.hadoop.fs.{FileStatus, FileSystem, GlobFilter, Path}
 import org.mockito.Mockito.{mock, when}
 
-import org.apache.spark.SparkException
+import org.apache.spark.{SparkException, SparkUnsupportedOperationException}
 import org.apache.spark.sql.{DataFrame, QueryTest, Row}
-import org.apache.spark.sql.catalyst.encoders.RowEncoder
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.execution.datasources.PartitionedFile
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.internal.SQLConf.SOURCES_BINARY_FILE_MAX_LENGTH
 import org.apache.spark.sql.sources._
-import org.apache.spark.sql.test.{SharedSQLContext, SQLTestUtils}
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
 
-class BinaryFileFormatSuite extends QueryTest with SharedSQLContext with SQLTestUtils {
+class BinaryFileFormatSuite extends QueryTest with SharedSparkSession {
   import BinaryFileFormat._
 
   private var testDir: String = _
@@ -162,12 +162,14 @@ class BinaryFileFormatSuite extends QueryTest with SharedSQLContext with SQLTest
   test("binary file data source do not support write operation") {
     val df = spark.read.format(BINARY_FILE).load(testDir)
     withTempDir { tmpDir =>
-      val thrown = intercept[UnsupportedOperationException] {
-        df.write
-          .format(BINARY_FILE)
-          .save(tmpDir + "/test_save")
-      }
-      assert(thrown.getMessage.contains("Write is not supported for binary file data source"))
+      checkError(
+        exception = intercept[SparkUnsupportedOperationException] {
+          df.write
+            .format(BINARY_FILE)
+            .save(s"$tmpDir/test_save")
+        },
+        condition = "_LEGACY_ERROR_TEMP_2075",
+        parameters = Map.empty)
     }
   }
 
@@ -183,7 +185,7 @@ class BinaryFileFormatSuite extends QueryTest with SharedSQLContext with SQLTest
   def testCreateFilterFunction(
       filters: Seq[Filter],
       testCases: Seq[(FileStatus, Boolean)]): Unit = {
-    val funcs = filters.map(BinaryFileFormat.createFilterFunction)
+    val funcs = filters.flatMap(BinaryFileFormat.createFilterFunction)
     testCases.foreach { case (status, expected) =>
       assert(funcs.forall(f => f(status)) === expected,
         s"$filters applied to $status should be $expected.")
@@ -250,6 +252,9 @@ class BinaryFileFormatSuite extends QueryTest with SharedSQLContext with SQLTest
       Seq(Or(LessThanOrEqual(MODIFICATION_TIME, new Timestamp(1L)),
         GreaterThanOrEqual(MODIFICATION_TIME, new Timestamp(3L)))),
       Seq((t1, true), (t2, false), (t3, true)))
+    testCreateFilterFunction(
+      Seq(Not(IsNull(LENGTH))),
+      Seq((t1, true), (t2, true), (t3, true)))
 
     // test filters applied on both columns
     testCreateFilterFunction(
@@ -275,7 +280,7 @@ class BinaryFileFormatSuite extends QueryTest with SharedSQLContext with SQLTest
         options = Map.empty,
         hadoopConf = spark.sessionState.newHadoopConf())
       val partitionedFile = mock(classOf[PartitionedFile])
-      when(partitionedFile.filePath).thenReturn(fileStatus.getPath.toString)
+      when(partitionedFile.toPath).thenReturn(fileStatus.getPath)
       assert(reader(partitionedFile).nonEmpty === expected,
         s"Filters $filters applied to $fileStatus should be $expected.")
     }
@@ -290,60 +295,58 @@ class BinaryFileFormatSuite extends QueryTest with SharedSQLContext with SQLTest
     ), true)
   }
 
+  private def readBinaryFile(file: File, requiredSchema: StructType): Row = {
+    val format = new BinaryFileFormat
+    val reader = format.buildReaderWithPartitionValues(
+      sparkSession = spark,
+      dataSchema = schema,
+      partitionSchema = StructType(Nil),
+      requiredSchema = requiredSchema,
+      filters = Seq.empty,
+      options = Map.empty,
+      hadoopConf = spark.sessionState.newHadoopConf()
+    )
+    val partitionedFile = mock(classOf[PartitionedFile])
+    when(partitionedFile.toPath).thenReturn(new Path(file.toURI))
+    val encoder = ExpressionEncoder(requiredSchema).resolveAndBind()
+    encoder.createDeserializer().apply(reader(partitionedFile).next())
+  }
+
   test("column pruning") {
-    def getRequiredSchema(fieldNames: String*): StructType = {
-      StructType(fieldNames.map {
-        case f if schema.fieldNames.contains(f) => schema(f)
-        case other => StructField(other, NullType)
-      })
-    }
-    def read(file: File, requiredSchema: StructType): Row = {
-      val format = new BinaryFileFormat
-      val reader = format.buildReaderWithPartitionValues(
-        sparkSession = spark,
-        dataSchema = schema,
-        partitionSchema = StructType(Nil),
-        requiredSchema = requiredSchema,
-        filters = Seq.empty,
-        options = Map.empty,
-        hadoopConf = spark.sessionState.newHadoopConf()
-      )
-      val partitionedFile = mock(classOf[PartitionedFile])
-      when(partitionedFile.filePath).thenReturn(file.getPath)
-      val encoder = RowEncoder(requiredSchema).resolveAndBind()
-      encoder.fromRow(reader(partitionedFile).next())
-    }
-    val file = new File(Utils.createTempDir(), "data")
-    val content = "123".getBytes
-    Files.write(file.toPath, content, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+    withTempPath { file =>
+      val content = "123".getBytes
+      Files.write(file.toPath, content, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
 
-    read(file, getRequiredSchema(MODIFICATION_TIME, CONTENT, LENGTH, PATH)) match {
-      case Row(t, c, len, p) =>
-        assert(t === new Timestamp(file.lastModified()))
-        assert(c === content)
-        assert(len === content.length)
-        assert(p.asInstanceOf[String].endsWith(file.getAbsolutePath))
+      val actual = readBinaryFile(file, StructType(schema.takeRight(3)))
+      val expected = Row(new Timestamp(file.lastModified()), content.length, content)
+
+      assert(actual === expected)
     }
-    file.setReadable(false)
-    withClue("cannot read content") {
+  }
+
+  test("column pruning - non-readable file") {
+    withTempPath { file =>
+      val content = "abc".getBytes
+      Files.write(file.toPath, content, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+      file.setReadable(false)
+
+      // If content is selected, it throws an exception because it's not readable.
       intercept[IOException] {
-        read(file, getRequiredSchema(CONTENT))
+        readBinaryFile(file, StructType(schema(CONTENT) :: Nil))
       }
-    }
-    assert(read(file, getRequiredSchema(LENGTH)) === Row(content.length),
-      "Get length should not read content.")
-    intercept[RuntimeException] {
-      read(file, getRequiredSchema(LENGTH, "other"))
-    }
 
-    val df = spark.read.format(BINARY_FILE).load(file.getPath)
-    assert(df.count() === 1, "Count should not read content.")
-    assert(df.select("LENGTH").first().getLong(0) === content.length,
-      "column pruning should be case insensitive")
+      // Otherwise, it should be able to read.
+      assert(
+        readBinaryFile(file, StructType(schema(LENGTH) :: Nil)) === Row(content.length),
+        "Get length should not read content.")
+      assert(
+        spark.read.format(BINARY_FILE).load(file.getPath).count() === 1,
+        "Count should not read content.")
+    }
   }
 
   test("fail fast and do not attempt to read if a file is too big") {
-    assert(spark.conf.get(SOURCES_BINARY_FILE_MAX_LENGTH) === Int.MaxValue)
+    assert(sqlConf.getConf(SOURCES_BINARY_FILE_MAX_LENGTH) === Int.MaxValue)
     withTempPath { file =>
       val path = file.getPath
       val content = "123".getBytes
@@ -354,18 +357,33 @@ class BinaryFileFormatSuite extends QueryTest with SharedSQLContext with SQLTest
           .select(CONTENT)
       }
       val expected = Seq(Row(content))
-      QueryTest.checkAnswer(readContent(), expected)
+      checkAnswer(readContent(), expected)
       withSQLConf(SOURCES_BINARY_FILE_MAX_LENGTH.key -> content.length.toString) {
-        QueryTest.checkAnswer(readContent(), expected)
+        checkAnswer(readContent(), expected)
       }
       // Disable read. If the implementation attempts to read, the exception would be different.
       file.setReadable(false)
       val caught = intercept[SparkException] {
         withSQLConf(SOURCES_BINARY_FILE_MAX_LENGTH.key -> (content.length - 1).toString) {
-          QueryTest.checkAnswer(readContent(), expected)
+          checkAnswer(readContent(), expected)
         }
       }
-      assert(caught.getMessage.contains("exceeds the max length allowed"))
+      assert(caught.getCondition.startsWith("FAILED_READ_FILE"))
+      assert(caught.getCause.getMessage.contains("exceeds the max length allowed"))
+    }
+  }
+
+  test("SPARK-28030: support chars in file names that require URL encoding") {
+    withTempDir { dir =>
+      val file = new File(dir, "test space.txt")
+      val content = "123".getBytes
+      Files.write(file.toPath, content, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+      val df = spark.read.format(BINARY_FILE).load(dir.getPath)
+      df.select(col(PATH), col(CONTENT)).first() match {
+        case Row(p: String, c: Array[Byte]) =>
+          assert(p.endsWith(file.getAbsolutePath), "should support space in file name")
+          assert(c === content, "should read file with space in file name")
+      }
     }
   }
 }

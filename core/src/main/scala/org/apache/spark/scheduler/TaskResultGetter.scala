@@ -25,8 +25,9 @@ import scala.util.control.NonFatal
 
 import org.apache.spark._
 import org.apache.spark.TaskState.TaskState
-import org.apache.spark.internal.Logging
-import org.apache.spark.serializer.SerializerInstance
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.CLASS_LOADER
+import org.apache.spark.serializer.{SerializerHelper, SerializerInstance}
 import org.apache.spark.util.{LongAccumulator, ThreadUtils, Utils}
 
 /**
@@ -63,21 +64,27 @@ private[spark] class TaskResultGetter(sparkEnv: SparkEnv, scheduler: TaskSchedul
         try {
           val (result, size) = serializer.get().deserialize[TaskResult[_]](serializedData) match {
             case directResult: DirectTaskResult[_] =>
-              if (!taskSetManager.canFetchMoreResults(serializedData.limit())) {
+              if (!taskSetManager.canFetchMoreResults(directResult.valueByteBuffer.size)) {
+                // kill the task so that it will not become zombie task
+                scheduler.handleFailedTask(taskSetManager, tid, TaskState.KILLED, TaskKilled(
+                  "Tasks result size has exceeded maxResultSize"))
                 return
               }
               // deserialize "value" without holding any lock so that it won't block other threads.
               // We should call it here, so that when it's called again in
               // "TaskSetManager.handleSuccessfulTask", it does not need to deserialize the value.
               directResult.value(taskResultSerializer.get())
-              (directResult, serializedData.limit())
+              (directResult, serializedData.limit().toLong)
             case IndirectTaskResult(blockId, size) =>
               if (!taskSetManager.canFetchMoreResults(size)) {
                 // dropped by executor if size is larger than maxResultSize
                 sparkEnv.blockManager.master.removeBlock(blockId)
+                // kill the task so that it will not become zombie task
+                scheduler.handleFailedTask(taskSetManager, tid, TaskState.KILLED, TaskKilled(
+                  "Tasks result size has exceeded maxResultSize"))
                 return
               }
-              logDebug("Fetching indirect task result for TID %s".format(tid))
+              logDebug(s"Fetching indirect task result for ${taskSetManager.taskName(tid)}")
               scheduler.handleTaskGettingResult(taskSetManager, tid)
               val serializedTaskResult = sparkEnv.blockManager.getRemoteBytes(blockId)
               if (serializedTaskResult.isEmpty) {
@@ -88,8 +95,10 @@ private[spark] class TaskResultGetter(sparkEnv: SparkEnv, scheduler: TaskSchedul
                   taskSetManager, tid, TaskState.FINISHED, TaskResultLost)
                 return
               }
-              val deserializedResult = serializer.get().deserialize[DirectTaskResult[_]](
-                serializedTaskResult.get.toByteBuffer)
+              val deserializedResult = SerializerHelper
+                .deserializeFromChunkedBuffer[DirectTaskResult[_]](
+                  serializer.get(),
+                  serializedTaskResult.get)
               // force deserialization of referenced value
               deserializedResult.value(taskResultSerializer.get())
               sparkEnv.blockManager.master.removeBlock(blockId)
@@ -103,7 +112,7 @@ private[spark] class TaskResultGetter(sparkEnv: SparkEnv, scheduler: TaskSchedul
             if (a.name == Some(InternalAccumulator.RESULT_SIZE)) {
               val acc = a.asInstanceOf[LongAccumulator]
               assert(acc.sum == 0L, "task result size should not have been set on the executors")
-              acc.setValue(size.toLong)
+              acc.setValue(size)
               acc
             } else {
               a
@@ -125,7 +134,7 @@ private[spark] class TaskResultGetter(sparkEnv: SparkEnv, scheduler: TaskSchedul
   }
 
   def enqueueFailedTask(taskSetManager: TaskSetManager, tid: Long, taskState: TaskState,
-    serializedData: ByteBuffer) {
+    serializedData: ByteBuffer): Unit = {
     var reason : TaskFailedReason = UnknownReason
     try {
       getTaskResultExecutor.execute(() => Utils.logUncaughtExceptions {
@@ -140,7 +149,8 @@ private[spark] class TaskResultGetter(sparkEnv: SparkEnv, scheduler: TaskSchedul
             // Log an error but keep going here -- the task failed, so not catastrophic
             // if we can't deserialize the reason.
             logError(
-              "Could not deserialize TaskEndReason: ClassNotFound with classloader " + loader)
+              log"Could not deserialize TaskEndReason: ClassNotFound with classloader " +
+                log"${MDC(CLASS_LOADER, loader)}")
           case _: Exception => // No-op
         } finally {
           // If there's an error while deserializing the TaskEndReason, this Runnable
@@ -164,7 +174,7 @@ private[spark] class TaskResultGetter(sparkEnv: SparkEnv, scheduler: TaskSchedul
     })
   }
 
-  def stop() {
+  def stop(): Unit = {
     getTaskResultExecutor.shutdownNow()
   }
 }

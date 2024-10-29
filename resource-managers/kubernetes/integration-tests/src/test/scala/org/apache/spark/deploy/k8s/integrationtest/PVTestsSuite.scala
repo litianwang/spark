@@ -16,28 +16,21 @@
  */
 package org.apache.spark.deploy.k8s.integrationtest
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import io.fabric8.kubernetes.api.model._
-import io.fabric8.kubernetes.api.model.storage.StorageClassBuilder
 import org.scalatest.concurrent.{Eventually, PatienceConfiguration}
 import org.scalatest.time.{Milliseconds, Span}
 
 import org.apache.spark.deploy.k8s.integrationtest.KubernetesSuite._
+import org.apache.spark.deploy.k8s.integrationtest.backend.minikube.MinikubeTestBackend
 
 private[spark] trait PVTestsSuite { k8sSuite: KubernetesSuite =>
   import PVTestsSuite._
 
   private def setupLocalStorage(): Unit = {
-    val scBuilder = new StorageClassBuilder()
-      .withKind("StorageClass")
-      .withApiVersion("storage.k8s.io/v1")
-      .withNewMetadata()
-        .withName(STORAGE_NAME)
-      .endMetadata()
-      .withProvisioner("kubernetes.io/no-provisioner")
-      .withVolumeBindingMode("WaitForFirstConsumer")
-
+    val storageClassName = if (testBackend == MinikubeTestBackend) "standard" else "hostpath"
+    val hostname = if (testBackend == MinikubeTestBackend) "minikube" else "docker-desktop"
     val pvBuilder = new PersistentVolumeBuilder()
       .withKind("PersistentVolume")
       .withApiVersion("v1")
@@ -45,10 +38,10 @@ private[spark] trait PVTestsSuite { k8sSuite: KubernetesSuite =>
         .withName("test-local-pv")
       .endMetadata()
       .withNewSpec()
-        .withCapacity(Map("storage" -> new QuantityBuilder().withAmount("1Gi").build()).asJava)
+        .withCapacity(Map("storage" -> new Quantity("1Gi")).asJava)
         .withAccessModes("ReadWriteOnce")
         .withPersistentVolumeReclaimPolicy("Retain")
-        .withStorageClassName("test-local-storage")
+        .withStorageClassName(storageClassName)
         .withLocal(new LocalVolumeSourceBuilder().withPath(VM_PATH).build())
           .withNewNodeAffinity()
             .withNewRequired()
@@ -56,7 +49,8 @@ private[spark] trait PVTestsSuite { k8sSuite: KubernetesSuite =>
                 .withMatchExpressions(new NodeSelectorRequirementBuilder()
                   .withKey("kubernetes.io/hostname")
                   .withOperator("In")
-                  .withValues("minikube").build()).build())
+                  .withValues(hostname)
+                  .build()).build())
             .endRequired()
           .endNodeAffinity()
       .endSpec()
@@ -69,17 +63,10 @@ private[spark] trait PVTestsSuite { k8sSuite: KubernetesSuite =>
       .endMetadata()
       .withNewSpec()
         .withAccessModes("ReadWriteOnce")
-        .withStorageClassName("test-local-storage")
-        .withResources(new ResourceRequirementsBuilder()
-        .withRequests(Map("storage" -> new QuantityBuilder()
-          .withAmount("1Gi").build()).asJava).build())
+        .withStorageClassName(storageClassName)
+        .withResources(new VolumeResourceRequirementsBuilder()
+          .withRequests(Map("storage" -> new Quantity("1Gi")).asJava).build())
       .endSpec()
-
-    kubernetesTestComponents
-      .kubernetesClient
-      .storage()
-      .storageClasses()
-      .create(scBuilder.build())
 
     kubernetesTestComponents
       .kubernetesClient
@@ -89,6 +76,7 @@ private[spark] trait PVTestsSuite { k8sSuite: KubernetesSuite =>
     kubernetesTestComponents
       .kubernetesClient
       .persistentVolumeClaims()
+      .inNamespace(kubernetesTestComponents.namespace)
       .create(pvcBuilder.build())
   }
 
@@ -96,6 +84,7 @@ private[spark] trait PVTestsSuite { k8sSuite: KubernetesSuite =>
     kubernetesTestComponents
       .kubernetesClient
       .persistentVolumeClaims()
+      .inNamespace(kubernetesTestComponents.namespace)
       .withName(PVC_NAME)
       .delete()
 
@@ -103,13 +92,6 @@ private[spark] trait PVTestsSuite { k8sSuite: KubernetesSuite =>
       .kubernetesClient
       .persistentVolumes()
       .withName(PV_NAME)
-      .delete()
-
-    kubernetesTestComponents
-      .kubernetesClient
-      .storage()
-      .storageClasses()
-      .withName(STORAGE_NAME)
       .delete()
   }
 
@@ -122,7 +104,75 @@ private[spark] trait PVTestsSuite { k8sSuite: KubernetesSuite =>
     }
   }
 
-  test("PVs with local storage", k8sTestTag, MinikubeTag) {
+  test("PVs with local hostpath storage on statefulsets", k8sTestTag, pvTestTag) {
+    assume(this.getClass.getSimpleName == "KubernetesSuite")
+    sparkAppConf
+      .set(s"spark.kubernetes.driver.volumes.persistentVolumeClaim.data.mount.path",
+        CONTAINER_MOUNT_PATH)
+      .set(s"spark.kubernetes.driver.volumes.persistentVolumeClaim.data.options.claimName",
+        PVC_NAME)
+      .set(s"spark.kubernetes.executor.volumes.persistentVolumeClaim.data.mount.path",
+        CONTAINER_MOUNT_PATH)
+      .set(s"spark.kubernetes.executor.volumes.persistentVolumeClaim.data.options.claimName",
+        PVC_NAME)
+      .set("spark.kubernetes.allocation.pods.allocator", "statefulset")
+    val file = Utils.createTempFile(FILE_CONTENTS, HOST_PATH)
+    try {
+      setupLocalStorage()
+      runMiniReadWriteAndVerifyCompletion(
+        FILE_CONTENTS.split(" ").length,
+        driverPodChecker = (driverPod: Pod) => {
+          doBasicDriverPodCheck(driverPod)
+        },
+        executorPodChecker = (executorPod: Pod) => {
+          doBasicExecutorPodCheck(executorPod)
+        },
+        appArgs = Array(s"$CONTAINER_MOUNT_PATH/$file"),
+        interval = Some(PV_TESTS_INTERVAL)
+      )
+    } finally {
+      // make sure this always runs
+      deleteLocalStorage()
+    }
+  }
+
+  ignore("PVs with local hostpath and storageClass on statefulsets", k8sTestTag, pvTestTag) {
+    assume(this.getClass.getSimpleName == "KubernetesSuite")
+    sparkAppConf
+      .set(s"spark.kubernetes.driver.volumes.persistentVolumeClaim.data.mount.path",
+        CONTAINER_MOUNT_PATH)
+      .set(s"spark.kubernetes.driver.volumes.persistentVolumeClaim.data.options.claimName",
+        PVC_NAME)
+      .set(s"spark.kubernetes.executor.volumes.persistentVolumeClaim.data.mount.path",
+        CONTAINER_MOUNT_PATH)
+      .set(s"spark.kubernetes.executor.volumes.persistentVolumeClaim.data.options.claimName",
+        PVC_NAME + "OnDemand")
+      .set(s"spark.kubernetes.executor.volumes.persistentVolumeClaim.data.options.storageClass",
+        "standard")
+      .set(s"spark.kubernetes.executor.volumes.persistentVolumeClaim.data.options.sizeLimit", "1G")
+      .set("spark.kubernetes.allocation.pods.allocator", "statefulset")
+    val file = Utils.createTempFile(FILE_CONTENTS, HOST_PATH)
+    try {
+      setupLocalStorage()
+      runMiniReadWriteAndVerifyCompletion(
+        FILE_CONTENTS.split(" ").length,
+        driverPodChecker = (driverPod: Pod) => {
+          doBasicDriverPodCheck(driverPod)
+        },
+        executorPodChecker = (executorPod: Pod) => {
+          doBasicExecutorPodCheck(executorPod)
+        },
+        appArgs = Array(s"$CONTAINER_MOUNT_PATH/$file"),
+        interval = Some(PV_TESTS_INTERVAL)
+      )
+    } finally {
+      // make sure this always runs
+      deleteLocalStorage()
+    }
+  }
+
+  test("PVs with local storage", k8sTestTag, pvTestTag) {
+    assume(this.getClass.getSimpleName == "KubernetesSuite")
     sparkAppConf
       .set(s"spark.kubernetes.driver.volumes.persistentVolumeClaim.data.mount.path",
         CONTAINER_MOUNT_PATH)
@@ -156,7 +206,6 @@ private[spark] trait PVTestsSuite { k8sSuite: KubernetesSuite =>
 }
 
 private[spark] object PVTestsSuite {
-  val STORAGE_NAME = "test-local-storage"
   val PV_NAME = "test-local-pv"
   val PVC_NAME = "test-local-pvc"
   val CONTAINER_MOUNT_PATH = "/opt/spark/pv-tests"

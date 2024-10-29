@@ -22,7 +22,9 @@ import java.util
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.XxHash64Function
+import org.apache.spark.sql.catalyst.optimizer.NormalizeFloatingNumbers.{DOUBLE_NORMALIZER, FLOAT_NORMALIZER}
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
 
 // A helper class for HyperLogLogPlusPlus.
 class HyperLogLogPlusPlusHelper(relativeSD: Double) extends Serializable {
@@ -88,7 +90,14 @@ class HyperLogLogPlusPlusHelper(relativeSD: Double) extends Serializable {
    *
    * Variable names in the HLL++ paper match variable names in the code.
    */
-  def update(buffer: InternalRow, bufferOffset: Int, value: Any, dataType: DataType): Unit = {
+  def update(buffer: InternalRow, bufferOffset: Int, _value: Any, dataType: DataType): Unit = {
+    val value = dataType match {
+      case FloatType => FLOAT_NORMALIZER.apply(_value)
+      case DoubleType => DOUBLE_NORMALIZER.apply(_value)
+      case st: StringType if !st.supportsBinaryEquality =>
+        CollationFactory.getCollationKeyBytes(_value.asInstanceOf[UTF8String], st.collationId)
+      case _ => _value
+    }
     // Create the hashed value 'x'.
     val x = XxHash64Function.hash(value, dataType, 42L)
 

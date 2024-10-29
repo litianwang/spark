@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution.benchmark
 
 import org.apache.spark.benchmark.Benchmark
 import org.apache.spark.sql.DataFrame
-import org.apache.spark.sql.functions.{array, struct}
+import org.apache.spark.sql.functions.{array, struct, timestamp_seconds}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
@@ -31,9 +31,11 @@ import org.apache.spark.sql.types._
  *
  * To run this benchmark:
  * {{{
- *   1. without sbt: bin/spark-submit --class <this class> <spark sql test jar>
- *   2. build/sbt "sql/test:runMain <this class>"
- *   3. generate result: SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "sql/test:runMain <this class>"
+ *   1. without sbt:
+ *      bin/spark-submit --class <this class>
+ *        --jars <spark core test jar>,<spark catalyst test jar> <spark sql test jar>
+ *   2. build/sbt "sql/Test/runMain <this class>"
+ *   3. generate result: SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "sql/Test/runMain <this class>"
  *      Results will be written to "benchmarks/InExpressionBenchmark-results.txt".
  * }}}
  */
@@ -44,14 +46,14 @@ object InExpressionBenchmark extends SqlBasedBenchmark {
   private def runByteBenchmark(numItems: Int, numRows: Long, minNumIters: Int): Unit = {
     val name = s"$numItems bytes"
     val values = (Byte.MinValue until Byte.MinValue + numItems).map(v => s"${v}Y")
-    val df = spark.range(0, numRows).select($"id".cast(ByteType))
+    val df = spark.range(0, numRows).selectExpr("mod(id, 256) as id")
     runBenchmark(name, df, values, numRows, minNumIters)
   }
 
   private def runShortBenchmark(numItems: Int, numRows: Long, minNumIters: Int): Unit = {
     val name = s"$numItems shorts"
     val values = (1 to numItems).map(v => s"${v}S")
-    val df = spark.range(0, numRows).select($"id".cast(ShortType))
+    val df = spark.range(0, numRows).selectExpr("mod(id, 32768) as id")
     runBenchmark(name, df, values, numRows, minNumIters)
   }
 
@@ -62,14 +64,14 @@ object InExpressionBenchmark extends SqlBasedBenchmark {
     require(isLookupSwitch(rangeSize, numItems))
     val name = s"$numItems shorts (non-compact)"
     val values = (Short.MinValue until maxValue by step).map(v => s"${v}S")
-    val df = spark.range(0, numRows).select($"id".cast(ShortType))
+    val df = spark.range(0, numRows).selectExpr("mod(id, 32768) as id")
     runBenchmark(name, df, values, numRows, minNumIters)
   }
 
   private def runIntBenchmark(numItems: Int, numRows: Long, minNumIters: Int): Unit = {
     val name = s"$numItems ints"
     val values = 1 to numItems
-    val df = spark.range(0, numRows).select($"id".cast(IntegerType))
+    val df = spark.range(0, numRows).selectExpr("mod(id, 2147483648) as id")
     runBenchmark(name, df, values, numRows, minNumIters)
   }
 
@@ -80,7 +82,7 @@ object InExpressionBenchmark extends SqlBasedBenchmark {
     require(isLookupSwitch(rangeSize, numItems))
     val name = s"$numItems ints (non-compact)"
     val values = Int.MinValue until maxValue.toInt by step.toInt
-    val df = spark.range(0, numRows).select($"id".cast(IntegerType))
+    val df = spark.range(0, numRows).selectExpr("mod(id, 2147483648) as id")
     runBenchmark(name, df, values, numRows, minNumIters)
   }
 
@@ -128,15 +130,15 @@ object InExpressionBenchmark extends SqlBasedBenchmark {
 
   private def runTimestampBenchmark(numItems: Int, numRows: Long, minNumIters: Int): Unit = {
     val name = s"$numItems timestamps"
-    val values = (1 to numItems).map(m => s"CAST('1970-01-01 01:00:00.$m' AS timestamp)")
-    val df = spark.range(0, numRows).select($"id".cast(TimestampType))
+    val values = (1 to numItems).map(m => s"timestamp'1970-01-01 01:00:00.$m'")
+    val df = spark.range(0, numRows).select(timestamp_seconds($"id").as("id"))
     runBenchmark(name, df, values, numRows, minNumIters)
   }
 
   private def runDateBenchmark(numItems: Int, numRows: Long, minNumIters: Int): Unit = {
     val name = s"$numItems dates"
-    val values = (1 to numItems).map(n => 1970 + n).map(y => s"CAST('$y-01-01' AS date)")
-    val df = spark.range(0, numRows).select($"id".cast(TimestampType).cast(DateType))
+    val values = (1 to numItems).map(n => 1970 + n).map(y => s"date'$y-01-01'")
+    val df = spark.range(0, numRows).select(timestamp_seconds($"id").cast(DateType).as("id"))
     runBenchmark(name, df, values, numRows, minNumIters)
   }
 
@@ -167,7 +169,7 @@ object InExpressionBenchmark extends SqlBasedBenchmark {
 
     def testClosure(): Unit = {
       val df = spark.sql(s"SELECT * FROM t WHERE id IN (${values.mkString(",")})")
-      df.queryExecution.toRdd.foreach(_ => Unit)
+      df.noop()
     }
 
     benchmark.addCase("In expression") { _ =>

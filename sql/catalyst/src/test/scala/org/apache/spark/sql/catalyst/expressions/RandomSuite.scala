@@ -18,6 +18,7 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.catalyst.CatalystTypeConverters
 import org.apache.spark.sql.types.{IntegerType, LongType}
 
 class RandomSuite extends SparkFunSuite with ExpressionEvalHelper {
@@ -33,5 +34,35 @@ class RandomSuite extends SparkFunSuite with ExpressionEvalHelper {
   test("SPARK-9127 codegen with long seed") {
     checkEvaluation(Rand(5419823303878592871L), 0.7145363364564755)
     checkEvaluation(Randn(5419823303878592871L), 0.7816815274533012)
+  }
+
+  test("SPARK-31594: Do not display the seed of rand/randn with no argument in output schema") {
+    assert(Rand(Literal(1L), true).sql === "rand()")
+    assert(Randn(Literal(1L), true).sql === "randn()")
+    assert(Rand(Literal(1L), false).sql === "rand(1L)")
+    assert(Randn(Literal(1L), false).sql === "randn(1L)")
+  }
+
+  test("SPARK-49505: Test the RANDSTR and UNIFORM SQL functions without codegen") {
+    // Note that we use a seed of zero in these tests to keep the results deterministic.
+    def testRandStr(first: Any, result: Any): Unit = {
+      checkEvaluationWithoutCodegen(
+        RandStr(Literal(first), Literal(0)), CatalystTypeConverters.convertToCatalyst(result))
+    }
+    testRandStr(1, "c")
+    testRandStr(5, "ceV0P")
+    testRandStr(10, "ceV0PXaR2I")
+    testRandStr(10L, "ceV0PXaR2I")
+
+    def testUniform(first: Any, second: Any, result: Any): Unit = {
+      checkEvaluationWithoutCodegen(
+        Uniform(Literal(first), Literal(second), Literal(0)).replacement,
+        CatalystTypeConverters.convertToCatalyst(result))
+    }
+    testUniform(0, 1, 0)
+    testUniform(0, 10, 7)
+    testUniform(0L, 10L, 7L)
+    testUniform(10.0F, 20.0F, 17.604954F)
+    testUniform(10L, 20.0F, 17.604954F)
   }
 }

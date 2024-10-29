@@ -20,17 +20,19 @@ package org.apache.spark
 import java.util.{Map => JMap}
 import java.util.concurrent.ConcurrentHashMap
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable.LinkedHashSet
+import scala.jdk.CollectionConverters._
 
 import org.apache.avro.{Schema, SchemaNormalization}
 
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.History._
 import org.apache.spark.internal.config.Kryo._
 import org.apache.spark.internal.config.Network._
 import org.apache.spark.serializer.KryoSerializer
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 /**
@@ -128,7 +130,7 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
 
   /** Set JAR files to distribute to the cluster. (Java-friendly version.) */
   def setJars(jars: Array[String]): SparkConf = {
-    setJars(jars.toSeq)
+    setJars(jars.toImmutableArraySeq)
   }
 
   /**
@@ -157,7 +159,7 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
    * (Java-friendly version.)
    */
   def setExecutorEnv(variables: Array[(String, String)]): SparkConf = {
-    setExecutorEnv(variables.toSeq)
+    setExecutorEnv(variables.toImmutableArraySeq)
   }
 
   /**
@@ -169,15 +171,6 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
 
   /** Set multiple parameters together */
   def setAll(settings: Iterable[(String, String)]): SparkConf = {
-    settings.foreach { case (k, v) => set(k, v) }
-    this
-  }
-
-  /**
-   * Set multiple parameters together
-   */
-  @deprecated("Use setAll(Iterable) instead", "3.0.0")
-  def setAll(settings: Traversable[(String, String)]): SparkConf = {
     settings.foreach { case (k, v) => set(k, v) }
     this
   }
@@ -332,7 +325,7 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
    * @throws NumberFormatException If the value cannot be interpreted as bytes
    */
   def getSizeAsBytes(key: String, defaultValue: Long): Long = catchIllegalValue(key) {
-    Utils.byteStringAsBytes(get(key, defaultValue + "B"))
+    Utils.byteStringAsBytes(get(key, s"${defaultValue}B"))
   }
 
   /**
@@ -416,14 +409,6 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
   }
 
   /**
-   * Get all parameters that start with `prefix` and end with 'suffix'
-   */
-  def getAllWithPrefixAndSuffix(prefix: String, suffix: String): Array[(String, String)] = {
-    getAll.filter { case (k, v) => k.startsWith(prefix) && k.endsWith(suffix) }
-      .map { case (k, v) => (k.substring(prefix.length, (k.length - suffix.length)), v) }
-  }
-
-  /**
    * Get a parameter as an integer, falling back to a default if not set
    * @throws NumberFormatException If the value cannot be interpreted as an integer
    */
@@ -457,7 +442,7 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
 
   /** Get all executor environment variables set on this SparkConf */
   def getExecutorEnv: Seq[(String, String)] = {
-    getAllWithPrefix("spark.executorEnv.")
+    getAllWithPrefix("spark.executorEnv.").toImmutableArraySeq
   }
 
   /**
@@ -507,52 +492,45 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
     }
   }
 
-  /**
-   * Get task resource requirements.
-   */
-  private[spark] def getTaskResourceRequirements(): Map[String, Int] = {
-    getAllWithPrefix(SPARK_TASK_RESOURCE_PREFIX)
-      .withFilter { case (k, v) => k.endsWith(SPARK_RESOURCE_COUNT_SUFFIX)}
-      .map { case (k, v) => (k.dropRight(SPARK_RESOURCE_COUNT_SUFFIX.length), v.toInt)}.toMap
-  }
 
   /**
    * Checks for illegal or deprecated config settings. Throws an exception for the former. Not
    * idempotent - may mutate this conf object to convert deprecated settings to supported ones.
    */
-  private[spark] def validateSettings() {
+  private[spark] def validateSettings(): Unit = {
     if (contains("spark.local.dir")) {
       val msg = "Note that spark.local.dir will be overridden by the value set by " +
-        "the cluster manager (via SPARK_LOCAL_DIRS in mesos/standalone/kubernetes and LOCAL_DIRS" +
+        "the cluster manager (via SPARK_LOCAL_DIRS in standalone/kubernetes and LOCAL_DIRS" +
         " in YARN)."
       logWarning(msg)
     }
 
-    val executorOptsKey = EXECUTOR_JAVA_OPTIONS.key
-
     // Used by Yarn in 1.1 and before
     sys.props.get("spark.driver.libraryPath").foreach { value =>
       val warning =
-        s"""
-          |spark.driver.libraryPath was detected (set to '$value').
+        log"""
+          |spark.driver.libraryPath was detected (set to '${MDC(LogKeys.CONFIG, value)}').
           |This is deprecated in Spark 1.2+.
           |
-          |Please instead use: ${DRIVER_LIBRARY_PATH.key}
+          |Please instead use: ${MDC(LogKeys.CONFIG2, DRIVER_LIBRARY_PATH.key)}
         """.stripMargin
       logWarning(warning)
     }
 
     // Validate spark.executor.extraJavaOptions
-    getOption(executorOptsKey).foreach { javaOpts =>
-      if (javaOpts.contains("-Dspark")) {
-        val msg = s"$executorOptsKey is not allowed to set Spark options (was '$javaOpts'). " +
-          "Set them directly on a SparkConf or in a properties file when using ./bin/spark-submit."
-        throw new Exception(msg)
-      }
-      if (javaOpts.contains("-Xmx")) {
-        val msg = s"$executorOptsKey is not allowed to specify max heap memory settings " +
-          s"(was '$javaOpts'). Use spark.executor.memory instead."
-        throw new Exception(msg)
+    Seq(EXECUTOR_JAVA_OPTIONS.key, "spark.executor.defaultJavaOptions").foreach { executorOptsKey =>
+      getOption(executorOptsKey).foreach { javaOpts =>
+        if (javaOpts.contains("-Dspark")) {
+          val msg = s"$executorOptsKey is not allowed to set Spark options (was '$javaOpts'). " +
+            "Set them directly on a SparkConf or in a properties file " +
+            "when using ./bin/spark-submit."
+          throw new Exception(msg)
+        }
+        if (javaOpts.contains("-Xmx")) {
+          val msg = s"$executorOptsKey is not allowed to specify max heap memory settings " +
+            s"(was '$javaOpts'). Use spark.executor.memory instead."
+          throw new Exception(msg)
+        }
       }
     }
 
@@ -561,23 +539,6 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
       val value = getDouble(key, 0.5)
       if (value > 1 || value < 0) {
         throw new IllegalArgumentException(s"$key should be between 0 and 1 (was '$value').")
-      }
-    }
-
-    if (contains("spark.master") && get("spark.master").startsWith("yarn-")) {
-      val warning = s"spark.master ${get("spark.master")} is deprecated in Spark 2.0+, please " +
-        "instead use \"yarn\" with specified deploy mode."
-
-      get("spark.master") match {
-        case "yarn-cluster" =>
-          logWarning(warning)
-          set("spark.master", "yarn")
-          set(SUBMIT_DEPLOY_MODE, "cluster")
-        case "yarn-client" =>
-          logWarning(warning)
-          set("spark.master", "yarn")
-          set(SUBMIT_DEPLOY_MODE, "client")
-        case _ => // Any other unexpected master will be checked when creating scheduler backend.
       }
     }
 
@@ -594,9 +555,13 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
       val executorCores = get(EXECUTOR_CORES)
       val leftCores = totalCores % executorCores
       if (leftCores != 0) {
-        logWarning(s"Total executor cores: ${totalCores} is not " +
-          s"divisible by cores per executor: ${executorCores}, " +
-          s"the left cores: ${leftCores} will not be allocated")
+        logWarning(log"Total executor cores: " +
+          log"${MDC(LogKeys.NUM_EXECUTOR_CORES_TOTAL, totalCores)} " +
+          log"is not divisible by cores per executor: " +
+          log"${MDC(LogKeys.NUM_EXECUTOR_CORES, executorCores)}, " +
+          log"the left cores: " +
+          log"${MDC(LogKeys.NUM_EXECUTOR_CORES_REMAINING, leftCores)} " +
+          log"will not be allocated")
       }
     }
 
@@ -610,7 +575,7 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
     // If spark.executor.heartbeatInterval bigger than spark.network.timeout,
     // it will almost always cause ExecutorLostFailure. See SPARK-22754.
     require(executorTimeoutThresholdMs > executorHeartbeatIntervalMs, "The value of " +
-      s"${networkTimeout}=${executorTimeoutThresholdMs}ms must be no less than the value of " +
+      s"${networkTimeout}=${executorTimeoutThresholdMs}ms must be greater than the value of " +
       s"${EXECUTOR_HEARTBEAT_INTERVAL.key}=${executorHeartbeatIntervalMs}ms.")
   }
 
@@ -645,14 +610,46 @@ private[spark] object SparkConf extends Logging {
           "are no longer accepted. To specify the equivalent now, one may use '64k'."),
       DeprecatedConfig("spark.rpc", "2.0", "Not used anymore."),
       DeprecatedConfig("spark.scheduler.executorTaskBlacklistTime", "2.1.0",
-        "Please use the new blacklisting options, spark.blacklist.*"),
+        "Please use the new excludedOnFailure options, spark.excludeOnFailure.*"),
       DeprecatedConfig("spark.yarn.am.port", "2.0.0", "Not used anymore"),
       DeprecatedConfig("spark.executor.port", "2.0.0", "Not used anymore"),
+      DeprecatedConfig("spark.rpc.numRetries", "2.2.0", "Not used anymore"),
+      DeprecatedConfig("spark.rpc.retry.wait", "2.2.0", "Not used anymore"),
       DeprecatedConfig("spark.shuffle.service.index.cache.entries", "2.3.0",
         "Not used anymore. Please use spark.shuffle.service.index.cache.size"),
       DeprecatedConfig("spark.yarn.credentials.file.retention.count", "2.4.0", "Not used anymore."),
       DeprecatedConfig("spark.yarn.credentials.file.retention.days", "2.4.0", "Not used anymore."),
-      DeprecatedConfig("spark.yarn.services", "3.0.0", "Feature no longer available.")
+      DeprecatedConfig("spark.yarn.services", "3.0.0", "Feature no longer available."),
+      DeprecatedConfig("spark.executor.plugins", "3.0.0",
+        "Feature replaced with new plugin API. See Monitoring documentation."),
+      DeprecatedConfig("spark.blacklist.enabled", "3.1.0",
+        "Please use spark.excludeOnFailure.enabled"),
+      DeprecatedConfig("spark.blacklist.task.maxTaskAttemptsPerExecutor", "3.1.0",
+        "Please use spark.excludeOnFailure.task.maxTaskAttemptsPerExecutor"),
+      DeprecatedConfig("spark.blacklist.task.maxTaskAttemptsPerNode", "3.1.0",
+        "Please use spark.excludeOnFailure.task.maxTaskAttemptsPerNode"),
+      DeprecatedConfig("spark.blacklist.application.maxFailedTasksPerExecutor", "3.1.0",
+        "Please use spark.excludeOnFailure.application.maxFailedTasksPerExecutor"),
+      DeprecatedConfig("spark.blacklist.stage.maxFailedTasksPerExecutor", "3.1.0",
+        "Please use spark.excludeOnFailure.stage.maxFailedTasksPerExecutor"),
+      DeprecatedConfig("spark.blacklist.application.maxFailedExecutorsPerNode", "3.1.0",
+        "Please use spark.excludeOnFailure.application.maxFailedExecutorsPerNode"),
+      DeprecatedConfig("spark.blacklist.stage.maxFailedExecutorsPerNode", "3.1.0",
+        "Please use spark.excludeOnFailure.stage.maxFailedExecutorsPerNode"),
+      DeprecatedConfig("spark.blacklist.timeout", "3.1.0",
+        "Please use spark.excludeOnFailure.timeout"),
+      DeprecatedConfig("spark.blacklist.application.fetchFailure.enabled", "3.1.0",
+        "Please use spark.excludeOnFailure.application.fetchFailure.enabled"),
+      DeprecatedConfig("spark.scheduler.blacklist.unschedulableTaskSetTimeout", "3.1.0",
+        "Please use spark.scheduler.excludeOnFailure.unschedulableTaskSetTimeout"),
+      DeprecatedConfig("spark.blacklist.killBlacklistedExecutors", "3.1.0",
+        "Please use spark.excludeOnFailure.killExcludedExecutors"),
+      DeprecatedConfig("spark.yarn.blacklist.executor.launch.blacklisting.enabled", "3.1.0",
+        "Please use spark.yarn.executor.launch.excludeOnFailure.enabled"),
+      DeprecatedConfig("spark.network.remoteReadNioBufferConversion", "3.5.2",
+        "Please open a JIRA ticket to report it if you need to use this configuration."),
+      DeprecatedConfig("spark.shuffle.unsafe.file.output.buffer", "4.0.0",
+        "Please use spark.shuffle.localDisk.file.output.buffer")
     )
 
     Map(configs.map { cfg => (cfg.key -> cfg) } : _*)
@@ -696,26 +693,17 @@ private[spark] object SparkConf extends Logging {
       AlternateConfig("spark.io.compression.snappy.block.size", "1.4")),
     IO_COMPRESSION_LZ4_BLOCKSIZE.key -> Seq(
       AlternateConfig("spark.io.compression.lz4.block.size", "1.4")),
-    RPC_NUM_RETRIES.key -> Seq(
-      AlternateConfig("spark.akka.num.retries", "1.4")),
-    RPC_RETRY_WAIT.key -> Seq(
-      AlternateConfig("spark.akka.retry.wait", "1.4")),
-    RPC_ASK_TIMEOUT.key -> Seq(
-      AlternateConfig("spark.akka.askTimeout", "1.4")),
-    RPC_LOOKUP_TIMEOUT.key -> Seq(
-      AlternateConfig("spark.akka.lookupTimeout", "1.4")),
     "spark.streaming.fileStream.minRememberDuration" -> Seq(
       AlternateConfig("spark.streaming.minRememberDuration", "1.5")),
     "spark.yarn.max.executor.failures" -> Seq(
       AlternateConfig("spark.yarn.max.worker.failures", "1.5")),
     MEMORY_OFFHEAP_ENABLED.key -> Seq(
       AlternateConfig("spark.unsafe.offHeap", "1.6")),
-    RPC_MESSAGE_MAX_SIZE.key -> Seq(
-      AlternateConfig("spark.akka.frameSize", "1.6")),
     "spark.yarn.jars" -> Seq(
       AlternateConfig("spark.yarn.jar", "2.0")),
     MAX_REMOTE_BLOCK_SIZE_FETCH_TO_MEM.key -> Seq(
-      AlternateConfig("spark.reducer.maxReqSizeShuffleToMem", "2.3")),
+      AlternateConfig("spark.reducer.maxReqSizeShuffleToMem", "2.3"),
+      AlternateConfig("spark.maxRemoteBlockSizeFetchToMem", "3.0")),
     LISTENER_BUS_EVENT_QUEUE_CAPACITY.key -> Seq(
       AlternateConfig("spark.scheduler.listenerbus.eventqueue.size", "2.3")),
     DRIVER_MEMORY_OVERHEAD.key -> Seq(
@@ -732,7 +720,11 @@ private[spark] object SparkConf extends Logging {
       AlternateConfig("spark.yarn.access.namenodes", "2.2"),
       AlternateConfig("spark.yarn.access.hadoopFileSystems", "3.0")),
     "spark.kafka.consumer.cache.capacity" -> Seq(
-      AlternateConfig("spark.sql.kafkaConsumerCache.capacity", "3.0"))
+      AlternateConfig("spark.sql.kafkaConsumerCache.capacity", "3.0")),
+    MAX_EXECUTOR_FAILURES.key -> Seq(
+      AlternateConfig("spark.yarn.max.executor.failures", "3.5")),
+    EXECUTOR_ATTEMPT_FAILURE_VALIDITY_INTERVAL_MS.key -> Seq(
+      AlternateConfig("spark.yarn.executor.failuresValidityInterval", "3.5"))
   )
 
   /**
@@ -757,6 +749,9 @@ private[spark] object SparkConf extends Logging {
     (name.startsWith("spark.auth") && name != SecurityManager.SPARK_AUTH_SECRET_CONF) ||
     name.startsWith("spark.rpc") ||
     name.startsWith("spark.network") ||
+    // We need SSL configs to propagate as they may be needed for RPCs.
+    // Passwords are propagated separately though.
+    (name.startsWith("spark.ssl") && !name.contains("Password")) ||
     isSparkPortConf(name)
   }
 
@@ -786,51 +781,22 @@ private[spark] object SparkConf extends Logging {
   def logDeprecationWarning(key: String): Unit = {
     deprecatedConfigs.get(key).foreach { cfg =>
       logWarning(
-        s"The configuration key '$key' has been deprecated as of Spark ${cfg.version} and " +
-        s"may be removed in the future. ${cfg.deprecationMessage}")
+        log"The configuration key '${MDC(LogKeys.CONFIG, key)}' has been deprecated " +
+          log"as of Spark ${MDC(LogKeys.CONFIG_VERSION, cfg.version)} and " +
+          log"may be removed in the future. " +
+          log"${MDC(LogKeys.CONFIG_DEPRECATION_MESSAGE, cfg.deprecationMessage)}")
       return
     }
 
     allAlternatives.get(key).foreach { case (newKey, cfg) =>
       logWarning(
-        s"The configuration key '$key' has been deprecated as of Spark ${cfg.version} and " +
-        s"may be removed in the future. Please use the new key '$newKey' instead.")
+        log"The configuration key '${MDC(LogKeys.CONFIG, key)}' " +
+          log"has been deprecated as of " +
+          log"Spark ${MDC(LogKeys.CONFIG_VERSION, cfg.version)} and " +
+          log"may be removed in the future. Please use the new key " +
+          log"'${MDC(LogKeys.CONFIG_KEY_UPDATED, newKey)}' instead.")
       return
     }
-    if (key.startsWith("spark.akka") || key.startsWith("spark.ssl.akka")) {
-      logWarning(
-        s"The configuration key $key is not supported anymore " +
-          s"because Spark doesn't use Akka since 2.0")
-    }
-  }
-
-  /**
-   * A function to help parsing configs with multiple parts where the base and
-   * suffix could be one of many options. For instance configs like:
-   * spark.executor.resource.{resourceName}.{count/addresses}
-   * This function takes an Array of configs you got from the
-   * getAllWithPrefix function, selects only those that end with the suffix
-   * passed in and returns just the base part of the config before the first
-   * '.' and its value.
-   */
-  def getConfigsWithSuffix(
-      configs: Array[(String, String)],
-      suffix: String
-      ): Array[(String, String)] = {
-    configs.filter { case (rConf, _) => rConf.endsWith(suffix)}.
-      map { case (k, v) => (k.split('.').head, v) }
-  }
-
-  /**
-   * A function to help parsing configs with multiple parts where the base and
-   * suffix could be one of many options. For instance configs like:
-   * spark.executor.resource.{resourceName}.{count/addresses}
-   * This function takes an Array of configs you got from the
-   * getAllWithPrefix function and returns the base part of the config
-   * before the first '.'.
-   */
-  def getBaseOfConfigs(configs: Array[(String, String)]): Set[String] = {
-    configs.map { case (k, _) => k.split('.').head }.toSet
   }
 
   /**
@@ -856,5 +822,4 @@ private[spark] object SparkConf extends Logging {
       key: String,
       version: String,
       translation: String => String = null)
-
 }

@@ -17,26 +17,23 @@
 
 package org.apache.spark.network.protocol;
 
-import com.google.common.base.Objects;
+import java.util.Objects;
+
 import io.netty.buffer.ByteBuf;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 
 /**
 * Encapsulates a request for a particular chunk of a stream.
 */
-public final class StreamChunkId implements Encodable {
-  public final long streamId;
-  public final int chunkIndex;
-
-  public StreamChunkId(long streamId, int chunkIndex) {
-    this.streamId = streamId;
-    this.chunkIndex = chunkIndex;
-  }
+public record StreamChunkId(long streamId, int chunkIndex) implements Encodable {
 
   @Override
   public int encodedLength() {
     return 8 + 4;
   }
 
+  @Override
   public void encode(ByteBuf buffer) {
     buffer.writeLong(streamId);
     buffer.writeInt(chunkIndex);
@@ -51,13 +48,12 @@ public final class StreamChunkId implements Encodable {
 
   @Override
   public int hashCode() {
-    return Objects.hashCode(streamId, chunkIndex);
+    return Objects.hash(streamId, chunkIndex);
   }
 
   @Override
   public boolean equals(Object other) {
-    if (other instanceof StreamChunkId) {
-      StreamChunkId o = (StreamChunkId) other;
+    if (other instanceof StreamChunkId o) {
       return streamId == o.streamId && chunkIndex == o.chunkIndex;
     }
     return false;
@@ -65,9 +61,9 @@ public final class StreamChunkId implements Encodable {
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("streamId", streamId)
-      .add("chunkIndex", chunkIndex)
+    return new ToStringBuilder(this, ToStringStyle.SHORT_PREFIX_STYLE)
+      .append("streamId", streamId)
+      .append("chunkIndex", chunkIndex)
       .toString();
   }
 }

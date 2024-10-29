@@ -19,7 +19,7 @@ package org.apache.spark.deploy.master
 
 import java.nio.ByteBuffer
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 
 import org.apache.curator.framework.CuratorFramework
@@ -52,14 +52,14 @@ private[master] class ZooKeeperPersistenceEngine(conf: SparkConf, val serializer
 
   override def read[T: ClassTag](prefix: String): Seq[T] = {
     zk.getChildren.forPath(workingDir).asScala
-      .filter(_.startsWith(prefix)).flatMap(deserializeFromFile[T])
+      .filter(_.startsWith(prefix)).flatMap(deserializeFromFile[T]).toSeq
   }
 
-  override def close() {
+  override def close(): Unit = {
     zk.close()
   }
 
-  private def serializeIntoFile(path: String, value: AnyRef) {
+  private def serializeIntoFile(path: String, value: AnyRef): Unit = {
     val serialized = serializer.newInstance().serialize(value)
     val bytes = new Array[Byte](serialized.remaining())
     serialized.get(bytes)

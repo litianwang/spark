@@ -133,12 +133,13 @@ class LevelDBTypeInfo {
 
     // First create the parent indices, then the child indices.
     ti.indices().forEach(idx -> {
-      if (idx.parent().isEmpty()) {
+      // In LevelDB, there is no parent index for the NATURAL INDEX.
+      if (idx.parent().isEmpty() || idx.value().equals(KVIndex.NATURAL_INDEX_NAME)) {
         indices.put(idx.value(), new Index(idx, ti.getAccessor(idx.value()), null));
       }
     });
     ti.indices().forEach(idx -> {
-      if (!idx.parent().isEmpty()) {
+      if (!idx.parent().isEmpty() && !idx.value().equals(KVIndex.NATURAL_INDEX_NAME)) {
         indices.put(idx.value(), new Index(idx, ti.getAccessor(idx.value()),
           indices.get(idx.parent())));
       }
@@ -458,13 +459,13 @@ class LevelDBTypeInfo {
     byte[] toKey(Object value, byte prefix) {
       final byte[] result;
 
-      if (value instanceof String) {
-        byte[] str = ((String) value).getBytes(UTF_8);
-        result = new byte[str.length + 1];
+      if (value instanceof String str) {
+        byte[] bytes = str.getBytes(UTF_8);
+        result = new byte[bytes.length + 1];
         result[0] = prefix;
-        System.arraycopy(str, 0, result, 1, str.length);
-      } else if (value instanceof Boolean) {
-        result = new byte[] { prefix, (Boolean) value ? TRUE : FALSE };
+        System.arraycopy(bytes, 0, result, 1, bytes.length);
+      } else if (value instanceof Boolean bool) {
+        result = new byte[] { prefix, bool ? TRUE : FALSE };
       } else if (value.getClass().isArray()) {
         int length = Array.getLength(value);
         byte[][] components = new byte[length][];

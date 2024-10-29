@@ -22,7 +22,6 @@ import org.scalatest.concurrent.{Signaler, ThreadSignaler, TimeLimits}
 import org.scalatest.time.{Seconds, Span}
 
 import org.apache.spark.{LocalSparkContext, SparkConf, SparkContext, SparkFunSuite, TaskContext}
-import org.apache.spark.util.Utils
 
 /**
  * Integration tests for the OutputCommitCoordinator.
@@ -59,7 +58,7 @@ class OutputCommitCoordinatorIntegrationSuite
 private class ThrowExceptionOnFirstAttemptOutputCommitter extends FileOutputCommitter {
   override def commitTask(context: TaskAttemptContext): Unit = {
     val ctx = TaskContext.get()
-    if (ctx.attemptNumber < 1) {
+    if (ctx.attemptNumber() < 1) {
       throw new java.io.FileNotFoundException("Intentional exception")
     }
     super.commitTask(context)

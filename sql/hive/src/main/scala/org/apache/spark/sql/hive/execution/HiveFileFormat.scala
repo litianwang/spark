@@ -17,25 +17,28 @@
 
 package org.apache.spark.sql.hive.execution
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.hive.ql.exec.Utilities
 import org.apache.hadoop.hive.ql.io.{HiveFileFormatUtils, HiveOutputFormat}
+import org.apache.hadoop.hive.ql.plan.FileSinkDesc
 import org.apache.hadoop.hive.serde2.Serializer
 import org.apache.hadoop.hive.serde2.objectinspector.{ObjectInspectorUtils, StructObjectInspector}
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorUtils.ObjectInspectorCopyOption
+import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils
 import org.apache.hadoop.io.Writable
 import org.apache.hadoop.mapred.{JobConf, Reporter}
 import org.apache.hadoop.mapreduce.{Job, TaskAttemptContext}
 
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.CLASS_NAME
 import org.apache.spark.internal.config.SPECULATION_ENABLED
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.datasources.{FileFormat, OutputWriter, OutputWriterFactory}
 import org.apache.spark.sql.hive.{HiveInspectors, HiveTableUtil}
-import org.apache.spark.sql.hive.HiveShim.{ShimFileSinkDesc => FileSinkDesc}
 import org.apache.spark.sql.sources.DataSourceRegister
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.SerializableJobConf
@@ -56,7 +59,7 @@ class HiveFileFormat(fileSinkConf: FileSinkDesc)
       sparkSession: SparkSession,
       options: Map[String, String],
       files: Seq[FileStatus]): Option[StructType] = {
-    throw new UnsupportedOperationException(s"inferSchema is not supported for hive data source.")
+    throw QueryExecutionErrors.inferSchemaUnsupportedForHiveError()
   }
 
   override def prepareWrite(
@@ -74,10 +77,10 @@ class HiveFileFormat(fileSinkConf: FileSinkDesc)
     val outputCommitterClass = conf.get("mapred.output.committer.class", "")
     if (speculationEnabled && outputCommitterClass.contains("Direct")) {
       val warningMessage =
-        s"$outputCommitterClass may be an output committer that writes data directly to " +
-          "the final location. Because speculation is enabled, this output committer may " +
-          "cause data loss (see the case in SPARK-10063). If possible, please use an output " +
-          "committer that does not have this behavior (e.g. FileOutputCommitter)."
+        log"${MDC(CLASS_NAME, outputCommitterClass)} may be an output committer that writes data " +
+          log"directly to the final location. Because speculation is enabled, this output " +
+          log"committer may cause data loss (see the case in SPARK-10063). If possible, please " +
+          log"use an output committer that does not have this behavior (e.g. FileOutputCommitter)."
       logWarning(warningMessage)
     }
 
@@ -105,10 +108,25 @@ class HiveFileFormat(fileSinkConf: FileSinkDesc)
       }
     }
   }
+
+  override def supportFieldName(name: String): Boolean = {
+    fileSinkConf.getTableInfo.getOutputFileFormatClassName match {
+      case "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat" =>
+        !name.matches(".*[ ,;{}()\n\t=].*")
+      case "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat" =>
+        try {
+          TypeInfoUtils.getTypeInfoFromTypeString(s"struct<$name:int>")
+          true
+        } catch {
+          case _: IllegalArgumentException => false
+        }
+      case _ => true
+    }
+  }
 }
 
 class HiveOutputWriter(
-    path: String,
+    val path: String,
     fileSinkConf: FileSinkDesc,
     jobConf: JobConf,
     dataSchema: StructType) extends OutputWriter with HiveInspectors {
@@ -130,10 +148,15 @@ class HiveOutputWriter(
     new Path(path),
     Reporter.NULL)
 
+  /**
+   * Since SPARK-30201 ObjectInspectorCopyOption.JAVA change to ObjectInspectorCopyOption.DEFAULT.
+   * The reason is DEFAULT option can convert `UTF8String` to `Text` with bytes and
+   * we can compatible with non UTF-8 code bytes during write.
+   */
   private val standardOI = ObjectInspectorUtils
     .getStandardObjectInspector(
       tableDesc.getDeserializer(jobConf).getObjectInspector,
-      ObjectInspectorCopyOption.JAVA)
+      ObjectInspectorCopyOption.DEFAULT)
     .asInstanceOf[StructObjectInspector]
 
   private val fieldOIs =

@@ -19,17 +19,22 @@ package org.apache.spark.sql.execution.window
 
 import java.util
 
+import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.aggregate.NoOp
 import org.apache.spark.sql.execution.ExternalAppendOnlyUnsafeRowArray
+import org.apache.spark.util.ArrayImplicits._
 
 
 /**
  * A window function calculates the results of a number of window functions for a window frame.
  * Before use a frame must be prepared by passing it all the rows in the current partition. After
  * preparation the update method can be called to fill the output rows.
+ *
+ * Note: `WindowFunctionFrame` instances are reused during window execution. The `prepare` method
+ * will be called before processing the next partition, and must reset the states.
  */
 abstract class WindowFunctionFrame {
   /**
@@ -47,14 +52,14 @@ abstract class WindowFunctionFrame {
   /**
    * The current lower window bound in the row array (inclusive).
    *
-   * This should be called after the current row is updated via [[write]]
+   * This should be called after the current row is updated via `write`.
    */
   def currentLowerBound(): Int
 
   /**
    * The current row index of the upper window bound in the row array (exclusive)
    *
-   * This should be called after the current row is updated via [[write]]
+   * This should be called after the current row is updated via `write`.
    */
   def currentUpperBound(): Int
 }
@@ -77,45 +82,47 @@ object WindowFunctionFrame {
  * @param newMutableProjection function used to create the projection.
  * @param offset by which rows get moved within a partition.
  */
-final class OffsetWindowFunctionFrame(
+abstract class OffsetWindowFunctionFrameBase(
     target: InternalRow,
     ordinal: Int,
     expressions: Array[OffsetWindowFunction],
     inputSchema: Seq[Attribute],
     newMutableProjection: (Seq[Expression], Seq[Attribute]) => MutableProjection,
-    offset: Int)
+    offset: Int,
+    ignoreNulls: Boolean)
   extends WindowFunctionFrame {
 
   /** Rows of the partition currently being processed. */
-  private[this] var input: ExternalAppendOnlyUnsafeRowArray = null
+  protected var input: ExternalAppendOnlyUnsafeRowArray = null
 
   /**
    * An iterator over the [[input]]
    */
-  private[this] var inputIterator: Iterator[UnsafeRow] = _
+  protected var inputIterator: Iterator[UnsafeRow] = _
 
   /** Index of the input row currently used for output. */
-  private[this] var inputIndex = 0
+  protected var inputIndex = 0
+
+  /** Attributes of the input row currently used for output. */
+  protected val inputAttrs = inputSchema.map(_.withNullability(true))
 
   /**
    * Create the projection used when the offset row exists.
    * Please note that this project always respect null input values (like PostgreSQL).
    */
-  private[this] val projection = {
+  protected val projection = {
     // Collect the expressions and bind them.
-    val inputAttrs = inputSchema.map(_.withNullability(true))
     val boundExpressions = Seq.fill(ordinal)(NoOp) ++ bindReferences(
-      expressions.toSeq.map(_.input), inputAttrs)
+      expressions.toImmutableArraySeq.map(_.input), inputAttrs)
 
     // Create the projection.
     newMutableProjection(boundExpressions, Nil).target(target)
   }
 
   /** Create the projection used when the offset row DOES NOT exists. */
-  private[this] val fillDefaultValue = {
+  protected val fillDefaultValue = {
     // Collect the expressions and bind them.
-    val inputAttrs: AttributeSeq = inputSchema.map(_.withNullability(true))
-    val boundExpressions = Seq.fill(ordinal)(NoOp) ++ expressions.toSeq.map { e =>
+    val boundExpressions = Seq.fill(ordinal)(NoOp) ++ expressions.toImmutableArraySeq.map { e =>
       if (e.default == null || e.default.foldable && e.default.eval() == null) {
         // The default value is null.
         Literal.create(null, e.dataType)
@@ -129,32 +136,259 @@ final class OffsetWindowFunctionFrame(
     newMutableProjection(boundExpressions, Nil).target(target)
   }
 
-  override def prepare(rows: ExternalAppendOnlyUnsafeRowArray): Unit = {
+  /** Holder the UnsafeRow where the input operator by function is not null. */
+  protected var nextSelectedRow = EmptyRow
+
+  // The number of rows skipped to get the next UnsafeRow where the input operator by function
+  // is not null.
+  protected var skippedNonNullCount = 0
+
+  protected val absOffset = Math.abs(offset)
+
+  // Reset the states by the data of the new partition.
+  protected def resetStates(rows: ExternalAppendOnlyUnsafeRowArray): Unit = {
     input = rows
     inputIterator = input.generateIterator()
-    // drain the first few rows if offset is larger than zero
     inputIndex = 0
-    while (inputIndex < offset) {
-      if (inputIterator.hasNext) inputIterator.next()
+    skippedNonNullCount = 0
+    nextSelectedRow = EmptyRow
+  }
+
+  /** Create the projection to determine whether input is null. */
+  protected val project = UnsafeProjection.create(Seq(IsNull(expressions.head.input)), inputSchema)
+
+  /** Check if the output value of the first index is null. */
+  protected def nullCheck(row: InternalRow): Boolean = project(row).getBoolean(0)
+
+  /** find the offset row whose input is not null */
+  protected def findNextRowWithNonNullInput(): Unit = {
+    // In order to find the offset row whose input is not-null,
+    // offset < = input.length must be guaranteed.
+    assert(offset <= input.length)
+    while (skippedNonNullCount < offset && inputIndex < input.length) {
+      val r = WindowFunctionFrame.getNextOrNull(inputIterator)
+      if (!nullCheck(r)) {
+        nextSelectedRow = r
+        skippedNonNullCount += 1
+      }
       inputIndex += 1
     }
+    if (skippedNonNullCount < offset && inputIndex == input.length) {
+      // The size of non-null input is less than offset, cannot find the offset row whose input
+      // is not null. Therefore, reset `nextSelectedRow` with empty row.
+      nextSelectedRow = EmptyRow
+    }
+  }
+
+  override def prepare(rows: ExternalAppendOnlyUnsafeRowArray): Unit = {
+    resetStates(rows)
+    if (absOffset > rows.length) {
+      fillDefaultValue(EmptyRow)
+    } else {
+      if (ignoreNulls) {
+        prepareForIgnoreNulls()
+      } else {
+        prepareForRespectNulls()
+      }
+    }
+  }
+
+  protected def prepareForIgnoreNulls(): Unit = findNextRowWithNonNullInput()
+
+  protected def prepareForRespectNulls(): Unit = {
+    // drain the first few rows if offset is larger than one
+    while (inputIndex < offset) {
+      nextSelectedRow = WindowFunctionFrame.getNextOrNull(inputIterator)
+      inputIndex += 1
+    }
+    // `inputIndex` starts as 0, but the `offset` can be negative and we may not enter the
+    // while loop at all. We need to make sure `inputIndex` ends up as `offset` to meet the
+    // assumption of the write path.
     inputIndex = offset
   }
 
-  override def write(index: Int, current: InternalRow): Unit = {
-    if (inputIndex >= 0 && inputIndex < input.length) {
-      val r = WindowFunctionFrame.getNextOrNull(inputIterator)
-      projection(r)
-    } else {
-      // Use default values since the offset row does not exist.
-      fillDefaultValue(current)
-    }
-    inputIndex += 1
+  override def currentLowerBound(): Int = throw SparkUnsupportedOperationException()
+
+  override def currentUpperBound(): Int = throw SparkUnsupportedOperationException()
+}
+
+/**
+ * The frameless offset window frame is an internal window frame just used to optimize the
+ * performance for the window function that returns the value of the input column offset
+ * by a number of rows according to the current row. The internal window frame is not a popular
+ * window frame cannot be specified and used directly by the users. This window frame
+ * calculates frames containing LEAD/LAG statements.
+ */
+class FrameLessOffsetWindowFunctionFrame(
+    target: InternalRow,
+    ordinal: Int,
+    expressions: Array[OffsetWindowFunction],
+    inputSchema: Seq[Attribute],
+    newMutableProjection: (Seq[Expression], Seq[Attribute]) => MutableProjection,
+    offset: Int,
+    ignoreNulls: Boolean = false)
+  extends OffsetWindowFunctionFrameBase(
+    target, ordinal, expressions, inputSchema, newMutableProjection, offset, ignoreNulls) {
+
+  private val doWrite = if (ignoreNulls && offset > 0) {
+    // For illustration, here is one example: the input data contains nine rows,
+    // and the input values of each row are: null, x, null, null, y, null, z, v, null.
+    // We use lead(input, 2) with IGNORE NULLS and the process is as follows:
+    // 1. current row -> null, next selected row -> y, output: y;
+    // 2. current row -> x, next selected row -> z, output: z;
+    // 3. current row -> null, next selected row -> z, output: z;
+    // 4. current row -> null, next selected row -> z, output: z;
+    // 5. current row -> y, next selected row -> v, output: v;
+    // 6. current row -> null, next selected row -> v, output: v;
+    // 7. current row -> z, next selected row -> empty, output: null;
+    // ... next selected row is empty, all following return null.
+    (current: InternalRow) =>
+      if (nextSelectedRow == EmptyRow) {
+        // Use default values since the offset row whose input value is not null does not exist.
+        fillDefaultValue(current)
+      } else {
+        if (nullCheck(current)) {
+          projection(nextSelectedRow)
+        } else {
+          skippedNonNullCount -= 1
+          findNextRowWithNonNullInput()
+          if (skippedNonNullCount == offset) {
+            projection(nextSelectedRow)
+          } else {
+            // Use default values since the offset row whose input value is not null does not exist.
+            fillDefaultValue(current)
+            nextSelectedRow = EmptyRow
+          }
+        }
+      }
+  } else if (ignoreNulls && offset < 0) {
+    // For illustration, here is one example: the input data contains nine rows,
+    // and the input values of each row are: null, x, null, null, y, null, z, v, null.
+    // We use lag(input, 1) with IGNORE NULLS and the process is as follows:
+    // 1. current row -> null, next selected row -> empty, output: null;
+    // 2. current row -> x, next selected row -> empty, output: null;
+    // 3. current row -> null, next selected row -> x, output: x;
+    // 4. current row -> null, next selected row -> x, output: x;
+    // 5. current row -> y, next selected row -> x, output: x;
+    // 6. current row -> null, next selected row -> y, output: y;
+    // 7. current row -> z, next selected row -> y, output: y;
+    // 8. current row -> v, next selected row -> z, output: z;
+    // 9. current row -> null, next selected row -> v, output: v;
+    (current: InternalRow) =>
+      if (skippedNonNullCount == absOffset) {
+        nextSelectedRow = EmptyRow
+        skippedNonNullCount -= 1
+        while (nextSelectedRow == EmptyRow && inputIndex < input.length) {
+          val r = WindowFunctionFrame.getNextOrNull(inputIterator)
+          if (!nullCheck(r)) {
+            nextSelectedRow = r
+          }
+          inputIndex += 1
+        }
+      }
+      if (nextSelectedRow == EmptyRow) {
+        // Use default values since the offset row whose input value is not null does not exist.
+        fillDefaultValue(current)
+      } else {
+        projection(nextSelectedRow)
+      }
+      if (!nullCheck(current)) {
+        skippedNonNullCount += 1
+      }
+  } else {
+    (current: InternalRow) =>
+      if (inputIndex >= 0 && inputIndex < input.length) {
+        val r = WindowFunctionFrame.getNextOrNull(inputIterator)
+        projection(r)
+      } else {
+        // Use default values since the offset row does not exist.
+        fillDefaultValue(current)
+      }
+      inputIndex += 1
   }
 
-  override def currentLowerBound(): Int = throw new UnsupportedOperationException()
+  override def write(index: Int, current: InternalRow): Unit = {
+    if (absOffset > input.length) {
+      // Already use default values in prepare.
+    } else {
+      doWrite(current)
+    }
+  }
+}
 
-  override def currentUpperBound(): Int = throw new UnsupportedOperationException()
+/**
+ * The unbounded offset window frame is an internal window frame just used to optimize the
+ * performance for the window function that returns the value of the input column offset
+ * by a number of rows within the frame and has specified ROWS BETWEEN UNBOUNDED PRECEDING
+ * AND UNBOUNDED FOLLOWING. The internal window frame is not a popular window frame cannot be
+ * specified and used directly by the users.
+ * The unbounded offset window frame calculates frames containing NTH_VALUE statements.
+ * The unbounded offset window frame return the same value for all rows in the window partition.
+ */
+class UnboundedOffsetWindowFunctionFrame(
+    target: InternalRow,
+    ordinal: Int,
+    expressions: Array[OffsetWindowFunction],
+    inputSchema: Seq[Attribute],
+    newMutableProjection: (Seq[Expression], Seq[Attribute]) => MutableProjection,
+    offset: Int,
+    ignoreNulls: Boolean = false)
+  extends OffsetWindowFunctionFrameBase(
+    target, ordinal, expressions, inputSchema, newMutableProjection, offset, ignoreNulls) {
+  assert(offset > 0)
+
+  override def prepareForIgnoreNulls(): Unit = {
+    super.prepareForIgnoreNulls()
+    if (nextSelectedRow == EmptyRow) {
+      // Use default values since the offset row whose input value is not null does not exist.
+      fillDefaultValue(EmptyRow)
+    } else {
+      projection(nextSelectedRow)
+    }
+  }
+
+  override def prepareForRespectNulls(): Unit = {
+    super.prepareForRespectNulls()
+    projection(nextSelectedRow)
+  }
+
+  override def write(index: Int, current: InternalRow): Unit = {
+    // The results are the same for each row in the partition, and have been evaluated in prepare.
+    // Don't need to recalculate here.
+  }
+}
+
+/**
+ * The unbounded preceding offset window frame is an internal window frame just used to optimize
+ * the performance for the window function that returns the value of the input column offset
+ * by a number of rows within the frame and has specified ROWS BETWEEN UNBOUNDED PRECEDING
+ * AND CURRENT ROW. The internal window frame is not a popular window frame cannot be specified
+ * and used directly by the users.
+ * The unbounded preceding offset window frame calculates frames containing NTH_VALUE statements.
+ * The unbounded preceding offset window frame return the same value for rows which index
+ * (starting from 1) equal to or greater than offset in the window partition.
+ */
+class UnboundedPrecedingOffsetWindowFunctionFrame(
+    target: InternalRow,
+    ordinal: Int,
+    expressions: Array[OffsetWindowFunction],
+    inputSchema: Seq[Attribute],
+    newMutableProjection: (Seq[Expression], Seq[Attribute]) => MutableProjection,
+    offset: Int,
+    ignoreNulls: Boolean = false)
+  extends OffsetWindowFunctionFrameBase(
+    target, ordinal, expressions, inputSchema, newMutableProjection, offset, ignoreNulls) {
+  assert(offset > 0)
+
+  override def write(index: Int, current: InternalRow): Unit = {
+    if (absOffset > input.length) {
+      // Already use default values in prepare.
+    } else if (index >= inputIndex - 1 && nextSelectedRow != null) {
+      projection(nextSelectedRow)
+    } else {
+      fillDefaultValue(EmptyRow)
+    }
+  }
 }
 
 /**
@@ -277,6 +511,8 @@ final class UnboundedWindowFunctionFrame(
       while (iterator.hasNext) {
         processor.update(iterator.next())
       }
+
+      processor.evaluate(target)
     }
 
     upperBound = rows.length
@@ -284,11 +520,8 @@ final class UnboundedWindowFunctionFrame(
 
   /** Write the frame columns for the current row to the given target row. */
   override def write(index: Int, current: InternalRow): Unit = {
-    // Unfortunately we cannot assume that evaluation is deterministic. So we need to re-evaluate
-    // for each row.
-    if (processor != null) {
-      processor.evaluate(target)
-    }
+    // The results are the same for each row in the partition, and have been evaluated in prepare.
+    // Don't need to recalculate here.
   }
 
   override def currentLowerBound(): Int = lowerBound

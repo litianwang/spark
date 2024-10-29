@@ -17,9 +17,7 @@
 
 package org.apache.spark.ui.jobs
 
-import javax.servlet.http.HttpServletRequest
-
-import scala.collection.JavaConverters._
+import jakarta.servlet.http.HttpServletRequest
 
 import org.apache.spark.JobExecutionStatus
 import org.apache.spark.internal.config.SCHEDULER_MODE
@@ -32,9 +30,12 @@ private[ui] class JobsTab(parent: SparkUI, store: AppStatusStore)
   extends SparkUITab(parent, "jobs") {
 
   val sc = parent.sc
+  val conf = parent.conf
   val killEnabled = parent.killEnabled
 
+  // Show pool information for only live UI.
   def isFairScheduler: Boolean = {
+    sc.isDefined &&
     store
       .environmentInfo()
       .sparkProperties
@@ -51,7 +52,7 @@ private[ui] class JobsTab(parent: SparkUI, store: AppStatusStore)
       Option(request.getParameter("id")).map(_.toInt).foreach { id =>
         store.asOption(store.job(id)).foreach { job =>
           if (job.status == JobExecutionStatus.RUNNING) {
-            sc.foreach(_.cancelJob(id))
+            sc.foreach(_.cancelJob(id, "killed via Web UI"))
             // Do a quick pause here to give Spark time to kill the job so it shows up as
             // killed after the refresh. Note that this will block the serving thread so the
             // time should be limited in duration.

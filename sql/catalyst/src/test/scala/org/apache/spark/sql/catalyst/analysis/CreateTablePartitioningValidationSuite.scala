@@ -17,88 +17,86 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import org.apache.spark.sql.catalog.v2.{Identifier, TableCatalog, TestTableCatalog}
-import org.apache.spark.sql.catalog.v2.expressions.LogicalExpressions
+import java.util
+
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
-import org.apache.spark.sql.catalyst.plans.logical.{CreateTableAsSelect, LeafNode}
+import org.apache.spark.sql.catalyst.plans.logical.{CreateTableAsSelect, LeafNode, OptionList, UnresolvedTableSpec}
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.connector.catalog.{InMemoryTableCatalog, Table, TableCapability, TableCatalog}
+import org.apache.spark.sql.connector.expressions.Expressions
 import org.apache.spark.sql.types.{DoubleType, LongType, StringType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.util.ArrayImplicits._
 
 class CreateTablePartitioningValidationSuite extends AnalysisTest {
-  import CreateTablePartitioningValidationSuite._
-
+  val tableSpec =
+    UnresolvedTableSpec(Map.empty, None, OptionList(Seq.empty), None, None, None, false)
   test("CreateTableAsSelect: fail missing top-level column") {
     val plan = CreateTableAsSelect(
-      catalog,
-      Identifier.of(Array(), "table_name"),
-      LogicalExpressions.bucket(4, "does_not_exist") :: Nil,
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
+      Expressions.bucket(4, "does_not_exist") :: Nil,
       TestRelation2,
-      Map.empty,
+      tableSpec,
       Map.empty,
       ignoreIfExists = false)
 
     assert(!plan.resolved)
-    assertAnalysisError(plan, Seq(
-      "Invalid partitioning",
-      "does_not_exist is missing or is in a map or array"))
+    assertAnalysisErrorCondition(plan,
+      expectedErrorCondition = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
+      expectedMessageParameters = Map("cols" -> "`does_not_exist`"))
   }
 
   test("CreateTableAsSelect: fail missing top-level column nested reference") {
     val plan = CreateTableAsSelect(
-      catalog,
-      Identifier.of(Array(), "table_name"),
-      LogicalExpressions.bucket(4, "does_not_exist.z") :: Nil,
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
+      Expressions.bucket(4, "does_not_exist.z") :: Nil,
       TestRelation2,
-      Map.empty,
+      tableSpec,
       Map.empty,
       ignoreIfExists = false)
 
     assert(!plan.resolved)
-    assertAnalysisError(plan, Seq(
-      "Invalid partitioning",
-      "does_not_exist.z is missing or is in a map or array"))
+    assertAnalysisErrorCondition(plan,
+      expectedErrorCondition = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
+      expectedMessageParameters = Map("cols" -> "`does_not_exist`.`z`"))
   }
 
   test("CreateTableAsSelect: fail missing nested column") {
     val plan = CreateTableAsSelect(
-      catalog,
-      Identifier.of(Array(), "table_name"),
-      LogicalExpressions.bucket(4, "point.z") :: Nil,
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
+      Expressions.bucket(4, "point.z") :: Nil,
       TestRelation2,
-      Map.empty,
+      tableSpec,
       Map.empty,
       ignoreIfExists = false)
 
     assert(!plan.resolved)
-    assertAnalysisError(plan, Seq(
-      "Invalid partitioning",
-      "point.z is missing or is in a map or array"))
+    assertAnalysisErrorCondition(plan,
+      expectedErrorCondition = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
+      expectedMessageParameters = Map("cols" -> "`point`.`z`"))
   }
 
   test("CreateTableAsSelect: fail with multiple errors") {
     val plan = CreateTableAsSelect(
-      catalog,
-      Identifier.of(Array(), "table_name"),
-      LogicalExpressions.bucket(4, "does_not_exist", "point.z") :: Nil,
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
+      Expressions.bucket(4, "does_not_exist", "point.z") :: Nil,
       TestRelation2,
-      Map.empty,
+      tableSpec,
       Map.empty,
       ignoreIfExists = false)
 
     assert(!plan.resolved)
-    assertAnalysisError(plan, Seq(
-      "Invalid partitioning",
-      "point.z is missing or is in a map or array",
-      "does_not_exist is missing or is in a map or array"))
+    assertAnalysisErrorCondition(plan,
+      expectedErrorCondition = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
+      expectedMessageParameters = Map("cols" -> "`does_not_exist`, `point`.`z`"))
   }
 
   test("CreateTableAsSelect: success with top-level column") {
     val plan = CreateTableAsSelect(
-      catalog,
-      Identifier.of(Array(), "table_name"),
-      LogicalExpressions.bucket(4, "id") :: Nil,
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
+      Expressions.bucket(4, "id") :: Nil,
       TestRelation2,
-      Map.empty,
+      tableSpec,
       Map.empty,
       ignoreIfExists = false)
 
@@ -107,11 +105,10 @@ class CreateTablePartitioningValidationSuite extends AnalysisTest {
 
   test("CreateTableAsSelect: success using nested column") {
     val plan = CreateTableAsSelect(
-      catalog,
-      Identifier.of(Array(), "table_name"),
-      LogicalExpressions.bucket(4, "point.x") :: Nil,
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
+      Expressions.bucket(4, "point.x") :: Nil,
       TestRelation2,
-      Map.empty,
+      tableSpec,
       Map.empty,
       ignoreIfExists = false)
 
@@ -120,11 +117,10 @@ class CreateTablePartitioningValidationSuite extends AnalysisTest {
 
   test("CreateTableAsSelect: success using complex column") {
     val plan = CreateTableAsSelect(
-      catalog,
-      Identifier.of(Array(), "table_name"),
-      LogicalExpressions.bucket(4, "point") :: Nil,
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
+      Expressions.bucket(4, "point") :: Nil,
       TestRelation2,
-      Map.empty,
+      tableSpec,
       Map.empty,
       ignoreIfExists = false)
 
@@ -132,9 +128,9 @@ class CreateTablePartitioningValidationSuite extends AnalysisTest {
   }
 }
 
-private object CreateTablePartitioningValidationSuite {
+private[sql] object CreateTablePartitioningValidationSuite {
   val catalog: TableCatalog = {
-    val cat = new TestTableCatalog()
+    val cat = new InMemoryTableCatalog()
     cat.initialize("test", CaseInsensitiveStringMap.empty())
     cat
   }
@@ -145,9 +141,15 @@ private object CreateTablePartitioningValidationSuite {
       .add("point", new StructType().add("x", DoubleType).add("y", DoubleType))
 }
 
-private case object TestRelation2 extends LeafNode with NamedRelation {
+private[sql] case object TestRelation2 extends LeafNode with NamedRelation {
   override def name: String = "source_relation"
   override def output: Seq[AttributeReference] =
-    CreateTablePartitioningValidationSuite.schema.toAttributes
+    DataTypeUtils.toAttributes(CreateTablePartitioningValidationSuite.schema)
 }
 
+private[sql] case object TestTable2 extends Table {
+  override def name: String = "table_name"
+  override def schema: StructType = CreateTablePartitioningValidationSuite.schema
+  override def capabilities: util.Set[TableCapability] =
+    util.EnumSet.noneOf(classOf[TableCapability])
+}

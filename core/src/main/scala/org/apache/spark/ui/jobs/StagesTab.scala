@@ -17,13 +17,14 @@
 
 package org.apache.spark.ui.jobs
 
-import javax.servlet.http.HttpServletRequest
+import jakarta.servlet.http.HttpServletRequest
 
 import org.apache.spark.internal.config.SCHEDULER_MODE
+import org.apache.spark.internal.config.UI.UI_THREAD_DUMPS_ENABLED
 import org.apache.spark.scheduler.SchedulingMode
 import org.apache.spark.status.AppStatusStore
 import org.apache.spark.status.api.v1.StageStatus
-import org.apache.spark.ui.{SparkUI, SparkUITab, UIUtils}
+import org.apache.spark.ui.{SparkUI, SparkUITab}
 
 /** Web UI showing progress status of all stages in the given SparkContext. */
 private[ui] class StagesTab(val parent: SparkUI, val store: AppStatusStore)
@@ -32,12 +33,17 @@ private[ui] class StagesTab(val parent: SparkUI, val store: AppStatusStore)
   val sc = parent.sc
   val conf = parent.conf
   val killEnabled = parent.killEnabled
+  val threadDumpEnabled =
+    parent.sc.isDefined && parent.conf.get(UI_THREAD_DUMPS_ENABLED)
 
   attachPage(new AllStagesPage(this))
   attachPage(new StagePage(this, store))
   attachPage(new PoolPage(this))
+  if (threadDumpEnabled) attachPage(new TaskThreadDumpPage(this, sc))
 
+  // Show pool information for only live UI.
   def isFairScheduler: Boolean = {
+    sc.isDefined &&
     store
       .environmentInfo()
       .sparkProperties

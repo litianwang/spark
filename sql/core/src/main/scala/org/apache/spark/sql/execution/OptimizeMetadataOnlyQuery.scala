@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution
 
 import java.util.Locale
 
-import org.apache.spark.sql.AnalysisException
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.catalog.{HiveTableRelation, SessionCatalog}
 import org.apache.spark.sql.catalyst.expressions._
@@ -28,7 +28,8 @@ import org.apache.spark.sql.catalyst.planning.PhysicalOperation
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils}
-import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
+import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelationWithTable}
 import org.apache.spark.sql.internal.SQLConf
 
 /**
@@ -45,7 +46,7 @@ import org.apache.spark.sql.internal.SQLConf
 case class OptimizeMetadataOnlyQuery(catalog: SessionCatalog) extends Rule[LogicalPlan] {
 
   def apply(plan: LogicalPlan): LogicalPlan = {
-    if (!SQLConf.get.optimizerMetadataOnly) {
+    if (!conf.optimizerMetadataOnly) {
       return plan
     }
 
@@ -96,8 +97,7 @@ case class OptimizeMetadataOnlyQuery(catalog: SessionCatalog) extends Rule[Logic
     val attrMap = relation.output.map(a => a.name.toLowerCase(Locale.ROOT) -> a).toMap
     partitionColumnNames.map { colName =>
       attrMap.getOrElse(colName.toLowerCase(Locale.ROOT),
-        throw new AnalysisException(s"Unable to find the column `$colName` " +
-          s"given [${relation.output.map(_.name).mkString(", ")}]")
+        throw QueryCompilationErrors.cannotFindColumnInRelationOutputError(colName, relation)
       )
     }
   }
@@ -117,26 +117,30 @@ case class OptimizeMetadataOnlyQuery(catalog: SessionCatalog) extends Rule[Logic
         case a: AttributeReference =>
           a.withName(relation.output.find(_.semanticEquals(a)).get.name)
       }
-    }
+    }.filterNot(SubqueryExpression.hasSubquery)
 
     child transform {
       case plan if plan eq relation =>
         relation match {
-          case l @ LogicalRelation(fsRelation: HadoopFsRelation, _, _, isStreaming) =>
+          case l @ LogicalRelationWithTable(fsRelation: HadoopFsRelation, _) =>
             val partAttrs = getPartitionAttrs(fsRelation.partitionSchema.map(_.name), l)
             val partitionData = fsRelation.location.listFiles(normalizedFilters, Nil)
-            LocalRelation(partAttrs, partitionData.map(_.values), isStreaming)
+            LocalRelation(partAttrs, partitionData.map(_.values), l.isStreaming)
 
           case relation: HiveTableRelation =>
             val partAttrs = getPartitionAttrs(relation.tableMeta.partitionColumnNames, relation)
             val caseInsensitiveProperties =
               CaseInsensitiveMap(relation.tableMeta.storage.properties)
             val timeZoneId = caseInsensitiveProperties.get(DateTimeUtils.TIMEZONE_OPTION)
-              .getOrElse(SQLConf.get.sessionLocalTimeZone)
-            val partitions = if (partFilters.nonEmpty) {
-              catalog.listPartitionsByFilter(relation.tableMeta.identifier, normalizedFilters)
-            } else {
-              catalog.listPartitions(relation.tableMeta.identifier)
+              .getOrElse(conf.sessionLocalTimeZone)
+            val partitions = relation.prunedPartitions match {
+              // for the case where partitions have already been pruned by PruneHiveTablePartitions
+              case Some(parts) => parts
+              case None => if (partFilters.nonEmpty) {
+                catalog.listPartitionsByFilter(relation.tableMeta.identifier, normalizedFilters)
+              } else {
+                catalog.listPartitions(relation.tableMeta.identifier)
+              }
             }
 
             val partitionData = partitions.map { p =>
@@ -147,7 +151,7 @@ case class OptimizeMetadataOnlyQuery(catalog: SessionCatalog) extends Rule[Logic
             LocalRelation(partAttrs, partitionData)
 
           case _ =>
-            throw new IllegalStateException(s"unrecognized table scan node: $relation, " +
+            throw SparkException.internalError(s"unrecognized table scan node: $relation, " +
               s"please turn off ${SQLConf.OPTIMIZER_METADATA_ONLY.key} and try again.")
         }
     }
@@ -157,11 +161,11 @@ case class OptimizeMetadataOnlyQuery(catalog: SessionCatalog) extends Rule[Logic
    * A pattern that finds the partitioned table relation node inside the given plan, and returns a
    * pair of the partition attributes and the table relation node.
    */
-  object PartitionedRelation extends PredicateHelper {
+  object PartitionedRelation {
 
     def unapply(plan: LogicalPlan): Option[(AttributeSet, LogicalPlan)] = {
       plan match {
-        case l @ LogicalRelation(fsRelation: HadoopFsRelation, _, _, _)
+        case l @ LogicalRelationWithTable(fsRelation: HadoopFsRelation, _)
             if fsRelation.partitionSchema.nonEmpty =>
           val partAttrs = AttributeSet(getPartitionAttrs(fsRelation.partitionSchema.map(_.name), l))
           Some((partAttrs, l))

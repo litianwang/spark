@@ -42,12 +42,10 @@ if [ -z "$SPARK_ENV_LOADED" ]; then
 fi
 
 # Setting SPARK_SCALA_VERSION if not already set.
-
-# TODO: revisit for Scala 2.13 support
-export SPARK_SCALA_VERSION=2.12
+export SPARK_SCALA_VERSION=2.13
 #if [ -z "$SPARK_SCALA_VERSION" ]; then
-#  SCALA_VERSION_1=2.12
-#  SCALA_VERSION_2=2.11
+#  SCALA_VERSION_1=2.13
+#  SCALA_VERSION_2=2.12
 #
 #  ASSEMBLY_DIR_1="${SPARK_HOME}/assembly/target/scala-${SCALA_VERSION_1}"
 #  ASSEMBLY_DIR_2="${SPARK_HOME}/assembly/target/scala-${SCALA_VERSION_2}"
@@ -65,3 +63,8 @@ export SPARK_SCALA_VERSION=2.12
 #    export SPARK_SCALA_VERSION=${SCALA_VERSION_2}
 #  fi
 #fi
+
+# Append jline option to enable the Beeline process to run in background.
+if [[ ( ! $(ps -o stat= -p $$) =~ "+" ) && ! ( -p /dev/stdin ) ]]; then
+  export SPARK_BEELINE_OPTS="$SPARK_BEELINE_OPTS -Djline.terminal=jline.UnsupportedTerminal"
+fi

@@ -16,15 +16,17 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.text
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.connector.read.PartitionReaderFactory
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.PartitioningAwareFileIndex
 import org.apache.spark.sql.execution.datasources.text.TextOptions
 import org.apache.spark.sql.execution.datasources.v2.TextBasedFileScan
-import org.apache.spark.sql.sources.v2.reader.PartitionReaderFactory
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.SerializableConfiguration
@@ -32,22 +34,38 @@ import org.apache.spark.util.SerializableConfiguration
 case class TextScan(
     sparkSession: SparkSession,
     fileIndex: PartitioningAwareFileIndex,
+    dataSchema: StructType,
     readDataSchema: StructType,
     readPartitionSchema: StructType,
-    options: CaseInsensitiveStringMap)
-  extends TextBasedFileScan(sparkSession, fileIndex, readDataSchema, readPartitionSchema, options) {
+    options: CaseInsensitiveStringMap,
+    partitionFilters: Seq[Expression] = Seq.empty,
+    dataFilters: Seq[Expression] = Seq.empty)
+  extends TextBasedFileScan(sparkSession, options) {
 
   private val optionsAsScala = options.asScala.toMap
   private lazy val textOptions: TextOptions = new TextOptions(optionsAsScala)
+
+  private def verifyReadSchema(schema: StructType): Unit = {
+    if (schema.size > 1) {
+      throw QueryCompilationErrors.textDataSourceWithMultiColumnsError(schema)
+    }
+  }
 
   override def isSplitable(path: Path): Boolean = {
     super.isSplitable(path) && !textOptions.wholeText
   }
 
+  override def getFileUnSplittableReason(path: Path): String = {
+    assert(!isSplitable(path))
+    if (!super.isSplitable(path)) {
+      super.getFileUnSplittableReason(path)
+    } else {
+      "the text datasource is set wholetext mode"
+    }
+  }
+
   override def createReaderFactory(): PartitionReaderFactory = {
-    assert(
-      readDataSchema.length <= 1,
-      "Text data source only produces a single data column named \"value\".")
+    verifyReadSchema(readDataSchema)
     val hadoopConf = {
       val caseSensitiveMap = options.asCaseSensitiveMap.asScala.toMap
       // Hadoop Configurations are case sensitive.
@@ -58,4 +76,12 @@ case class TextScan(
     TextPartitionReaderFactory(sparkSession.sessionState.conf, broadcastedConf, readDataSchema,
       readPartitionSchema, textOptions)
   }
+
+  override def equals(obj: Any): Boolean = obj match {
+    case t: TextScan => super.equals(t) && options == t.options
+
+    case _ => false
+  }
+
+  override def hashCode(): Int = super.hashCode()
 }

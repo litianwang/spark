@@ -17,18 +17,16 @@
 
 package org.apache.spark.sql.execution.datasources.json
 
-import java.nio.charset.{Charset, StandardCharsets}
-
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.mapreduce.{Job, TaskAttemptContext}
 
-import org.apache.spark.internal.Logging
-import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.ExprUtils
 import org.apache.spark.sql.catalyst.json._
 import org.apache.spark.sql.catalyst.util.CompressionCodecs
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
@@ -57,8 +55,10 @@ class JsonFileFormat extends TextBasedFileFormat with DataSourceRegister {
       options,
       sparkSession.sessionState.conf.sessionLocalTimeZone,
       sparkSession.sessionState.conf.columnNameOfCorruptRecord)
-    JsonDataSource(parsedOptions).inferSchema(
-      sparkSession, files, parsedOptions)
+    parsedOptions.singleVariantColumn match {
+      case Some(columnName) => Some(StructType(Array(StructField(columnName, VariantType))))
+      case None => JsonDataSource(parsedOptions).inferSchema(sparkSession, files, parsedOptions)
+    }
   }
 
   override def prepareWrite(
@@ -112,20 +112,15 @@ class JsonFileFormat extends TextBasedFileFormat with DataSourceRegister {
 
     if (requiredSchema.length == 1 &&
       requiredSchema.head.name == parsedOptions.columnNameOfCorruptRecord) {
-      throw new AnalysisException(
-        "Since Spark 2.3, the queries from raw JSON/CSV files are disallowed when the\n" +
-        "referenced columns only include the internal corrupt record column\n" +
-        s"(named _corrupt_record by default). For example:\n" +
-        "spark.read.schema(schema).json(file).filter($\"_corrupt_record\".isNotNull).count()\n" +
-        "and spark.read.schema(schema).json(file).select(\"_corrupt_record\").show().\n" +
-        "Instead, you can cache or save the parsed results and then send the same query.\n" +
-        "For example, val df = spark.read.schema(schema).json(file).cache() and then\n" +
-        "df.filter($\"_corrupt_record\".isNotNull).count()."
-      )
+      throw QueryCompilationErrors.queryFromRawFilesIncludeCorruptRecordColumnError()
     }
 
     (file: PartitionedFile) => {
-      val parser = new JacksonParser(actualSchema, parsedOptions, allowArrayAsStructs = true)
+      val parser = new JacksonParser(
+        actualSchema,
+        parsedOptions,
+        allowArrayAsStructs = true,
+        filters)
       JsonDataSource(parsedOptions).readFile(
         broadcastedHadoopConf.value.value,
         file,
@@ -141,6 +136,8 @@ class JsonFileFormat extends TextBasedFileFormat with DataSourceRegister {
   override def equals(other: Any): Boolean = other.isInstanceOf[JsonFileFormat]
 
   override def supportDataType(dataType: DataType): Boolean = dataType match {
+    case _: VariantType => true
+
     case _: AtomicType => true
 
     case st: StructType => st.forall { f => supportDataType(f.dataType) }

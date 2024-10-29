@@ -17,14 +17,15 @@
 
 package org.apache.spark.ui
 
-import java.net.{URI, URL}
+import java.net.{URI, URL, URLDecoder}
 import java.util.EnumSet
-import javax.servlet.DispatcherType
-import javax.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
 
 import scala.language.implicitConversions
+import scala.util.Try
 import scala.xml.Node
 
+import jakarta.servlet.DispatcherType
+import jakarta.servlet.http._
 import org.eclipse.jetty.client.HttpClient
 import org.eclipse.jetty.client.api.Response
 import org.eclipse.jetty.client.http.HttpClientTransportOverHTTP
@@ -39,7 +40,9 @@ import org.json4s.JValue
 import org.json4s.jackson.JsonMethods.{pretty, render}
 
 import org.apache.spark.{SecurityManager, SparkConf, SSLOptions}
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config.UI._
 import org.apache.spark.util.Utils
 
@@ -73,7 +76,7 @@ private[spark] object JettyUtils extends Logging {
       servletParams: ServletParams[T],
       conf: SparkConf): HttpServlet = {
     new HttpServlet {
-      override def doGet(request: HttpServletRequest, response: HttpServletResponse) {
+      override def doGet(request: HttpServletRequest, response: HttpServletResponse): Unit = {
         try {
           response.setContentType("%s;charset=utf-8".format(servletParams.contentType))
           response.setStatus(HttpServletResponse.SC_OK)
@@ -83,7 +86,8 @@ private[spark] object JettyUtils extends Logging {
           case e: IllegalArgumentException =>
             response.sendError(HttpServletResponse.SC_BAD_REQUEST, e.getMessage)
           case e: Exception =>
-            logWarning(s"GET ${request.getRequestURI} failed: $e", e)
+            logWarning(log"GET ${MDC(LogKeys.URI, request.getRequestURI)} failed: " +
+              log"${MDC(ERROR, e)}", e)
             throw e
         }
       }
@@ -146,7 +150,10 @@ private[spark] object JettyUtils extends Logging {
       private def doRequest(request: HttpServletRequest, response: HttpServletResponse): Unit = {
         beforeRedirect(request)
         // Make sure we don't end up with "//" in the middle
-        val newUrl = new URL(new URL(request.getRequestURL.toString), prefixedDestPath).toString
+        val requestURL = new URI(request.getRequestURL.toString).toURL
+        // scalastyle:off URLConstructor
+        val newUrl = new URL(requestURL, prefixedDestPath).toString
+        // scalastyle:on URLConstructor
         response.sendRedirect(newUrl)
       }
       // SPARK-5983 ensure TRACE is not supported
@@ -203,7 +210,7 @@ private[spark] object JettyUtils extends Logging {
         // SPARK-21176: Use the Jetty logic to calculate the number of selector threads (#CPUs/2),
         // but limit it to 8 max.
         val numSelectors = math.max(1, math.min(8, Runtime.getRuntime().availableProcessors() / 2))
-        new HttpClient(new HttpClientTransportOverHTTP(numSelectors), null)
+        new HttpClient(new HttpClientTransportOverHTTP(numSelectors))
       }
 
       override def filterServerResponseHeader(
@@ -242,10 +249,14 @@ private[spark] object JettyUtils extends Logging {
       port: Int,
       sslOptions: SSLOptions,
       conf: SparkConf,
-      serverName: String = ""): ServerInfo = {
+      serverName: String = "",
+      poolSize: Int = 200): ServerInfo = {
 
+    val stopTimeout = conf.get(UI_JETTY_STOP_TIMEOUT)
+    logInfo(log"Start Jetty ${MDC(HOST, hostName)}:${MDC(PORT, port)}" +
+      log" for ${MDC(SERVER_NAME, serverName)}")
     // Start the server first, with no connectors.
-    val pool = new QueuedThreadPool
+    val pool = new QueuedThreadPool(poolSize)
     if (serverName.nonEmpty) {
       pool.setName(serverName)
     }
@@ -259,12 +270,21 @@ private[spark] object JettyUtils extends Logging {
     server.addBean(errorHandler)
 
     val collection = new ContextHandlerCollection
-    server.setHandler(collection)
+    conf.get(PROXY_REDIRECT_URI) match {
+      case Some(proxyUri) =>
+        val proxyHandler = new ProxyRedirectHandler(proxyUri)
+        proxyHandler.setHandler(collection)
+        server.setHandler(proxyHandler)
+
+      case _ =>
+        server.setHandler(collection)
+    }
 
     // Executor used to create daemon threads for the Jetty connectors.
     val serverExecutor = new ScheduledExecutorScheduler(s"$serverName-JettyScheduler", true)
 
     try {
+      server.setStopTimeout(stopTimeout)
       server.start()
 
       // As each acceptor and each selector will use one thread, the number of threads should at
@@ -285,6 +305,8 @@ private[spark] object JettyUtils extends Logging {
         connector.setPort(port)
         connector.setHost(hostName)
         connector.setReuseAddress(!Utils.isWindows)
+         // spark-45248: set the idle timeout to prevent slow DoS
+        connector.setIdleTimeout(8000)
 
         // Currently we only use "SelectChannelConnector"
         // Limit the max acceptor number to 8 so that we don't waste a lot of threads
@@ -297,12 +319,28 @@ private[spark] object JettyUtils extends Logging {
         (connector, connector.getLocalPort())
       }
       val httpConfig = new HttpConfiguration()
-      httpConfig.setRequestHeaderSize(conf.get(UI_REQUEST_HEADER_SIZE).toInt)
+      val requestHeaderSize = conf.get(UI_REQUEST_HEADER_SIZE).toInt
+      logDebug(s"Using requestHeaderSize: $requestHeaderSize")
+      httpConfig.setRequestHeaderSize(requestHeaderSize)
+
+      // Hide information.
+      logDebug("Using setSendServerVersion: false")
+      httpConfig.setSendServerVersion(false)
+      logDebug("Using setSendXPoweredBy: false")
+      httpConfig.setSendXPoweredBy(false)
 
       // If SSL is configured, create the secure connector first.
-      val securePort = sslOptions.createJettySslContextFactory().map { factory =>
+      val securePort = sslOptions.createJettySslContextFactoryServer().map { factory =>
+
+        // SPARK-45522: SniHostCheck defaulted to true since Jetty 10,
+        // this will affect the standalone deployment.
+        val src = new SecureRequestCustomizer()
+        src.setSniHostCheck(false)
+        httpConfig.addCustomizer(src)
+
         val securePort = sslOptions.port.getOrElse(if (port > 0) Utils.userPort(port, 400) else 0)
         val secureServerName = if (serverName.nonEmpty) s"$serverName (HTTPS)" else serverName
+
         val connectionFactories = AbstractConnectionFactory.getFactories(factory,
           new HttpConnectionFactory(httpConfig))
 
@@ -366,8 +404,7 @@ private[spark] object JettyUtils extends Logging {
         if (baseRequest.isSecure) {
           return
         }
-        val httpsURI = createRedirectURI(scheme, baseRequest.getServerName, securePort,
-          baseRequest.getRequestURI, baseRequest.getQueryString)
+        val httpsURI = createRedirectURI(scheme, securePort, baseRequest)
         response.setContentLength(0)
         response.sendRedirect(response.encodeRedirectURL(httpsURI))
         baseRequest.setHandled(true)
@@ -391,17 +428,13 @@ private[spark] object JettyUtils extends Logging {
       uri.append(rest)
     }
 
-    val rewrittenURI = URI.create(uri.toString())
-    if (query != null) {
-      return new URI(
-          rewrittenURI.getScheme(),
-          rewrittenURI.getAuthority(),
-          rewrittenURI.getPath(),
-          query,
-          rewrittenURI.getFragment()
-        ).normalize()
+    val queryString = if (query == null) {
+      ""
+    } else {
+      s"?$query"
     }
-    rewrittenURI.normalize()
+    // SPARK-33611: use method `URI.create` to avoid percent-encoding twice on the query string.
+    URI.create(uri.toString() + queryString).normalize()
   }
 
   def createProxyLocationHeader(
@@ -429,16 +462,34 @@ private[spark] object JettyUtils extends Logging {
     handler.addFilter(holder, "/*", EnumSet.allOf(classOf[DispatcherType]))
   }
 
+  private def decodeURL(url: String, encoding: String): String = {
+    if (url == null) {
+      null
+    } else {
+      URLDecoder.decode(url, encoding)
+    }
+  }
+
   // Create a new URI from the arguments, handling IPv6 host encoding and default ports.
-  private def createRedirectURI(
-      scheme: String, server: String, port: Int, path: String, query: String) = {
+  private def createRedirectURI(scheme: String, port: Int, request: Request): String = {
+    val server = request.getServerName
     val redirectServer = if (server.contains(":") && !server.startsWith("[")) {
       s"[${server}]"
     } else {
       server
     }
     val authority = s"$redirectServer:$port"
-    new URI(scheme, authority, path, query, null).toString
+    val queryEncoding = if (request.getQueryEncoding != null) {
+      request.getQueryEncoding
+    } else {
+      // By default decoding the URI as "UTF-8" should be enough for SparkUI
+      "UTF-8"
+    }
+    // The request URL can be raw or encoded here. To avoid the request URL being
+    // encoded twice, let's decode it here.
+    val requestURI = decodeURL(request.getRequestURI, queryEncoding)
+    val queryString = decodeURL(request.getQueryString, queryEncoding)
+    new URI(scheme, authority, requestURI, queryString, null).toString
   }
 
   def toVirtualHosts(connectors: String*): Array[String] = connectors.map("@" + _).toArray
@@ -486,10 +537,20 @@ private[spark] case class ServerInfo(
   }
 
   def stop(): Unit = {
+    val threadPool = server.getThreadPool
+    threadPool match {
+      case pool: QueuedThreadPool =>
+        // Workaround for SPARK-30385 to avoid Jetty's acceptor thread shrink.
+        // As of Jetty 9.4.21, the implementation of
+        // QueuedThreadPool#setIdleTimeout is changed and IllegalStateException
+        // will be thrown if we try to set idle timeout after the server has started.
+        // But this workaround works for Jetty 9.4.28 by ignoring the exception.
+        Try(pool.setIdleTimeout(0))
+      case _ =>
+    }
     server.stop()
     // Stop the ThreadPool if it supports stop() method (through LifeCycle).
     // It is needed because stopping the Server won't stop the ThreadPool it uses.
-    val threadPool = server.getThreadPool
     if (threadPool != null && threadPool.isInstanceOf[LifeCycle]) {
       threadPool.asInstanceOf[LifeCycle].stop
     }
@@ -501,7 +562,9 @@ private[spark] case class ServerInfo(
    */
   private def addFilters(handler: ServletContextHandler, securityMgr: SecurityManager): Unit = {
     conf.get(UI_FILTERS).foreach { filter =>
-      logInfo(s"Adding filter to ${handler.getContextPath()}: $filter")
+      logInfo(log"Adding filter to" +
+        log" ${MDC(SERVLET_CONTEXT_HANDLER_PATH, handler.getContextPath())}:" +
+        log" ${MDC(UI_FILTER, filter)}")
       val oldParams = conf.getOption(s"spark.$filter.params").toSeq
         .flatMap(Utils.stringToSeq)
         .flatMap { param =>
@@ -521,6 +584,49 @@ private[spark] case class ServerInfo(
     val securityFilter = new HttpSecurityFilter(conf, securityMgr)
     val holder = new FilterHolder(securityFilter)
     handler.addFilter(holder, "/*", EnumSet.allOf(classOf[DispatcherType]))
+  }
+
+}
+
+/**
+ * A Jetty handler to handle redirects to a proxy server. It intercepts redirects and rewrites the
+ * location to point to the proxy server.
+ *
+ * The handler needs to be set as the server's handler, because Jetty sometimes generates redirects
+ * before invoking any servlet handlers or filters. One of such cases is when asking for the root of
+ * a servlet context without the trailing slash (e.g. "/jobs") - Jetty will send a redirect to the
+ * same URL, but with a trailing slash.
+ */
+private class ProxyRedirectHandler(_proxyUri: String) extends HandlerWrapper {
+
+  private val proxyUri = _proxyUri.stripSuffix("/")
+
+  override def handle(
+      target: String,
+      baseRequest: Request,
+      request: HttpServletRequest,
+      response: HttpServletResponse): Unit = {
+    super.handle(target, baseRequest, request, new ResponseWrapper(request, response))
+  }
+
+  private class ResponseWrapper(
+      req: HttpServletRequest,
+      res: HttpServletResponse)
+    extends HttpServletResponseWrapper(res) {
+
+    override def sendRedirect(location: String): Unit = {
+      val newTarget = if (location != null) {
+        val target = new URI(location)
+        // The target path should already be encoded, so don't re-encode it, just the
+        // proxy address part.
+        val proxyBase = UIUtils.uiRoot(req)
+        val proxyPrefix = if (proxyBase.nonEmpty) s"$proxyUri$proxyBase" else proxyUri
+        s"${res.encodeURL(proxyPrefix)}${target.getPath()}"
+      } else {
+        null
+      }
+      super.sendRedirect(newTarget)
+    }
   }
 
 }

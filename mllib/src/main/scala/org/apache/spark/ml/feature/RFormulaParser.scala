@@ -22,6 +22,7 @@ import scala.util.parsing.combinator.RegexParsers
 
 import org.apache.spark.ml.linalg.VectorUDT
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Represents a parsed R formula.
@@ -125,7 +126,7 @@ private[ml] case class ParsedRFormula(label: ColumnRef, terms: Seq[Term]) {
     schema.fields.filter(_.dataType match {
       case _: NumericType | StringType | BooleanType | _: VectorUDT => true
       case _ => false
-    }).map(_.name).filter(_ != label.value)
+    }).map(_.name).filter(_ != label.value).toImmutableArraySeq
   }
 }
 
@@ -286,6 +287,7 @@ private[ml] object RFormulaParser extends RegexParsers {
 
   private val pow: Parser[Term] = term ~ "^" ~ "^[1-9]\\d*".r ^^ {
     case base ~ "^" ~ degree => power(base, degree.toInt)
+    case t => throw new IllegalArgumentException(s"Invalid term: $t")
   } | term
 
   private val interaction: Parser[Term] = pow * (":" ^^^ { interact _ })
@@ -298,7 +300,10 @@ private[ml] object RFormulaParser extends RegexParsers {
   private val expr = (sum | term)
 
   private val formula: Parser[ParsedRFormula] =
-    (label ~ "~" ~ expr) ^^ { case r ~ "~" ~ t => ParsedRFormula(r, t.asTerms.terms) }
+    (label ~ "~" ~ expr) ^^ {
+      case r ~ "~" ~ t => ParsedRFormula(r, t.asTerms.terms)
+      case t => throw new IllegalArgumentException(s"Invalid term: $t")
+    }
 
   def parse(value: String): ParsedRFormula = parseAll(formula, value) match {
     case Success(result, _) => result

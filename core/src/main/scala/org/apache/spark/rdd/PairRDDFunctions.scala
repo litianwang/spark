@@ -21,8 +21,8 @@ import java.nio.ByteBuffer
 import java.util.{HashMap => JHashMap}
 
 import scala.collection.{mutable, Map}
-import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 
 import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus
@@ -34,13 +34,15 @@ import org.apache.hadoop.mapreduce.{Job => NewAPIHadoopJob, OutputFormat => NewO
 
 import org.apache.spark._
 import org.apache.spark.Partitioner.defaultPartitioner
-import org.apache.spark.annotation.Experimental
-import org.apache.spark.internal.Logging
+import org.apache.spark.errors.SparkCoreErrors
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config.SPECULATION_ENABLED
 import org.apache.spark.internal.io._
 import org.apache.spark.partial.{BoundedDouble, PartialResult}
 import org.apache.spark.serializer.Serializer
 import org.apache.spark.util.{SerializableConfiguration, SerializableJobConf, Utils}
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.collection.CompactBuffer
 import org.apache.spark.util.random.StratifiedSamplingUtils
 
@@ -52,7 +54,6 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
   extends Logging with Serializable {
 
   /**
-   * :: Experimental ::
    * Generic function to combine the elements for each key using a custom set of aggregation
    * functions. Turns an RDD[(K, V)] into a result of type RDD[(K, C)], for a "combined type" C
    *
@@ -68,7 +69,6 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
    * @note V and C can be different -- for example, one might group an RDD of type
    * (Int, Int) into an RDD of type (Int, Seq[Int]).
    */
-  @Experimental
   def combineByKeyWithClassTag[C](
       createCombiner: V => C,
       mergeValue: (C, V) => C,
@@ -79,10 +79,10 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
     require(mergeCombiners != null, "mergeCombiners must be defined") // required as of Spark 0.9.0
     if (keyClass.isArray) {
       if (mapSideCombine) {
-        throw new SparkException("Cannot use map-side combining with array keys.")
+        throw SparkCoreErrors.cannotUseMapSideCombiningWithArrayKeyError()
       }
       if (partitioner.isInstanceOf[HashPartitioner]) {
-        throw new SparkException("HashPartitioner cannot partition array keys.")
+        throw SparkCoreErrors.hashPartitionerCannotPartitionArrayKeyError()
       }
     }
     val aggregator = new Aggregator[K, V, C](
@@ -136,10 +136,8 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
   }
 
   /**
-   * :: Experimental ::
    * Simplified version of combineByKeyWithClassTag that hash-partitions the output RDD.
    */
-  @Experimental
   def combineByKeyWithClassTag[C](
       createCombiner: V => C,
       mergeValue: (C, V) => C,
@@ -153,7 +151,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
    * Aggregate the values of each key, using given combine functions and a neutral "zero value".
    * This function can return a different result type, U, than the type of the values in this RDD,
    * V. Thus, we need one operation for merging a V into a U and one operation for merging two U's,
-   * as in scala.TraversableOnce. The former operation is used for merging values within a
+   * as in scala.IterableOnce. The former operation is used for merging values within a
    * partition, and the latter is used for merging values between partitions. To avoid memory
    * allocation, both of these functions are allowed to modify and return their first argument
    * instead of creating a new U.
@@ -178,7 +176,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
    * Aggregate the values of each key, using given combine functions and a neutral "zero value".
    * This function can return a different result type, U, than the type of the values in this RDD,
    * V. Thus, we need one operation for merging a V into a U and one operation for merging two U's,
-   * as in scala.TraversableOnce. The former operation is used for merging values within a
+   * as in scala.IterableOnce. The former operation is used for merging values within a
    * partition, and the latter is used for merging values between partitions. To avoid memory
    * allocation, both of these functions are allowed to modify and return their first argument
    * instead of creating a new U.
@@ -192,7 +190,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
    * Aggregate the values of each key, using given combine functions and a neutral "zero value".
    * This function can return a different result type, U, than the type of the values in this RDD,
    * V. Thus, we need one operation for merging a V into a U and one operation for merging two U's,
-   * as in scala.TraversableOnce. The former operation is used for merging values within a
+   * as in scala.IterableOnce. The former operation is used for merging values within a
    * partition, and the latter is used for merging values between partitions. To avoid memory
    * allocation, both of these functions are allowed to modify and return their first argument
    * instead of creating a new U.
@@ -266,7 +264,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
     } else {
       StratifiedSamplingUtils.getBernoulliSamplingFunction(self, fractions, false, seed)
     }
-    self.mapPartitionsWithIndex(samplingFunc, preservesPartitioning = true)
+    self.mapPartitionsWithIndex(samplingFunc, preservesPartitioning = true, isOrderSensitive = true)
   }
 
   /**
@@ -296,7 +294,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
     } else {
       StratifiedSamplingUtils.getBernoulliSamplingFunction(self, fractions, true, seed)
     }
-    self.mapPartitionsWithIndex(samplingFunc, preservesPartitioning = true)
+    self.mapPartitionsWithIndex(samplingFunc, preservesPartitioning = true, isOrderSensitive = true)
   }
 
   /**
@@ -336,7 +334,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
     val cleanedF = self.sparkContext.clean(func)
 
     if (keyClass.isArray) {
-      throw new SparkException("reduceByKeyLocally() does not support array keys")
+      throw SparkCoreErrors.reduceByKeyLocallyNotSupportArrayKeysError()
     }
 
     val reducePartition = (iter: Iterator[(K, V)]) => {
@@ -529,7 +527,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
    */
   def partitionBy(partitioner: Partitioner): RDD[(K, V)] = self.withScope {
     if (keyClass.isArray && partitioner.isInstanceOf[HashPartitioner]) {
-      throw new SparkException("HashPartitioner cannot partition array keys.")
+      throw SparkCoreErrors.hashPartitionerCannotPartitionArrayKeyError()
     }
     if (self.partitioner == Some(partitioner)) {
       self
@@ -616,11 +614,9 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
   }
 
   /**
-   * :: Experimental ::
    * Simplified version of combineByKeyWithClassTag that hash-partitions the resulting RDD using the
    * existing partitioner/parallelism level.
    */
-  @Experimental
   def combineByKeyWithClassTag[C](
       createCombiner: V => C,
       mergeValue: (C, V) => C,
@@ -763,11 +759,11 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
    * Pass each value in the key-value pair RDD through a flatMap function without changing the
    * keys; this also retains the original RDD's partitioning.
    */
-  def flatMapValues[U](f: V => TraversableOnce[U]): RDD[(K, U)] = self.withScope {
+  def flatMapValues[U](f: V => IterableOnce[U]): RDD[(K, U)] = self.withScope {
     val cleanF = self.context.clean(f)
     new MapPartitionsRDD[(K, U), (K, V)](self,
       (context, pid, iter) => iter.flatMap { case (k, v) =>
-        cleanF(v).map(x => (k, x))
+        cleanF(v).iterator.map(x => (k, x))
       },
       preservesPartitioning = true)
   }
@@ -783,7 +779,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
       partitioner: Partitioner)
       : RDD[(K, (Iterable[V], Iterable[W1], Iterable[W2], Iterable[W3]))] = self.withScope {
     if (partitioner.isInstanceOf[HashPartitioner] && keyClass.isArray) {
-      throw new SparkException("HashPartitioner cannot partition array keys.")
+      throw SparkCoreErrors.hashPartitionerCannotPartitionArrayKeyError()
     }
     val cg = new CoGroupedRDD[K](Seq(self, other1, other2, other3), partitioner)
     cg.mapValues { case Array(vs, w1s, w2s, w3s) =>
@@ -801,7 +797,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
   def cogroup[W](other: RDD[(K, W)], partitioner: Partitioner)
       : RDD[(K, (Iterable[V], Iterable[W]))] = self.withScope {
     if (partitioner.isInstanceOf[HashPartitioner] && keyClass.isArray) {
-      throw new SparkException("HashPartitioner cannot partition array keys.")
+      throw SparkCoreErrors.hashPartitionerCannotPartitionArrayKeyError()
     }
     val cg = new CoGroupedRDD[K](Seq(self, other), partitioner)
     cg.mapValues { case Array(vs, w1s) =>
@@ -816,7 +812,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
   def cogroup[W1, W2](other1: RDD[(K, W1)], other2: RDD[(K, W2)], partitioner: Partitioner)
       : RDD[(K, (Iterable[V], Iterable[W1], Iterable[W2]))] = self.withScope {
     if (partitioner.isInstanceOf[HashPartitioner] && keyClass.isArray) {
-      throw new SparkException("HashPartitioner cannot partition array keys.")
+      throw SparkCoreErrors.hashPartitionerCannotPartitionArrayKeyError()
     }
     val cg = new CoGroupedRDD[K](Seq(self, other1, other2), partitioner)
     cg.mapValues { case Array(vs, w1s, w2s) =>
@@ -941,12 +937,12 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
           for (pair <- it if pair._1 == key) {
             buf += pair._2
           }
-          buf
+          buf.toSeq
         } : Seq[V]
-        val res = self.context.runJob(self, process, Array(index))
+        val res = self.context.runJob(self, process, Array(index).toImmutableArraySeq)
         res(0)
       case None =>
-        self.filter(_._1 == key).map(_._2).collect()
+        self.filter(_._1 == key).map(_._2).collect().toImmutableArraySeq
     }
   }
 
@@ -1056,10 +1052,11 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
     val outputCommitterClass = hadoopConf.get("mapred.output.committer.class", "")
     if (speculationEnabled && outputCommitterClass.contains("Direct")) {
       val warningMessage =
-        s"$outputCommitterClass may be an output committer that writes data directly to " +
-          "the final location. Because speculation is enabled, this output committer may " +
-          "cause data loss (see the case in SPARK-10063). If possible, please use an output " +
-          "committer that does not have this behavior (e.g. FileOutputCommitter)."
+        log"${MDC(CLASS_NAME, outputCommitterClass)} " +
+          log"may be an output committer that writes data directly to " +
+          log"the final location. Because speculation is enabled, this output committer may " +
+          log"cause data loss (see the case in SPARK-10063). If possible, please use an output " +
+          log"committer that does not have this behavior (e.g. FileOutputCommitter)."
       logWarning(warningMessage)
     }
 

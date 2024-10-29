@@ -20,15 +20,17 @@ package org.apache.spark.mllib.util
 import scala.annotation.varargs
 import scala.reflect.ClassTag
 
-import org.apache.spark.SparkContext
+import org.apache.spark.{SparkContext, SparkException}
 import org.apache.spark.annotation.Since
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.OPTIMIZER_CLASS_NAME
 import org.apache.spark.ml.linalg.{MatrixUDT => MLMatrixUDT, VectorUDT => MLVectorUDT}
+import org.apache.spark.ml.util.Instrumentation
 import org.apache.spark.mllib.linalg._
 import org.apache.spark.mllib.linalg.BLAS.dot
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.rdd.{PartitionwiseSampledRDD, RDD}
-import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
+import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 import org.apache.spark.sql.execution.datasources.DataSource
 import org.apache.spark.sql.execution.datasources.text.TextFileFormat
 import org.apache.spark.sql.functions._
@@ -105,16 +107,19 @@ object MLUtils extends Logging {
   }
 
   private[spark] def parseLibSVMFile(
-      sparkSession: SparkSession, paths: Seq[String]): RDD[(Double, Array[Int], Array[Double])] = {
+      sparkSession: SparkSession,
+      paths: Seq[String],
+      options: Map[String, String]): RDD[(Double, Array[Int], Array[Double])] = {
     val lines = sparkSession.baseRelationToDataFrame(
       DataSource.apply(
         sparkSession,
         paths = paths,
-        className = classOf[TextFileFormat].getName
+        className = classOf[TextFileFormat].getName,
+        options = options ++ Map(DataSource.GLOB_PATHS_KEY -> "false")
       ).resolveRelation(checkFilesExist = false))
       .select("value")
 
-    import lines.sqlContext.implicits._
+    import lines.sparkSession.implicits._
 
     lines.select(trim($"value").as("line"))
       .filter(not((length($"line") === 0).or($"line".startsWith("#"))))
@@ -144,7 +149,7 @@ object MLUtils extends Logging {
       previous = current
       i += 1
     }
-    (label, indices.toArray, values.toArray)
+    (label, indices, values)
   }
 
   /**
@@ -173,7 +178,7 @@ object MLUtils extends Logging {
    * @see `org.apache.spark.mllib.util.MLUtils.loadLibSVMFile`
    */
   @Since("1.0.0")
-  def saveAsLibSVMFile(data: RDD[LabeledPoint], dir: String) {
+  def saveAsLibSVMFile(data: RDD[LabeledPoint], dir: String): Unit = {
     // TODO: allow to specify label precision and feature precision.
     val dataStr = data.map { case LabeledPoint(label, features) =>
       val sb = new StringBuilder(label.toString)
@@ -244,6 +249,36 @@ object MLUtils extends Logging {
         complement = false)
       val validation = new PartitionwiseSampledRDD(rdd, sampler, true, seed)
       val training = new PartitionwiseSampledRDD(rdd, sampler.cloneComplement(), true, seed)
+      (training, validation)
+    }.toArray
+  }
+
+  /**
+   * Version of `kFold()` taking a fold column name.
+   */
+  @Since("3.1.0")
+  def kFold(df: DataFrame, numFolds: Int, foldColName: String): Array[(RDD[Row], RDD[Row])] = {
+    val foldCol = df.col(foldColName)
+    val checker = udf { foldNum: Int =>
+      // Valid fold number is in range [0, numFolds).
+      if (foldNum < 0 || foldNum >= numFolds) {
+        throw new SparkException(s"Fold number must be in range [0, $numFolds), but got $foldNum.")
+      }
+      true
+    }
+    (0 until numFolds).map { fold =>
+      val training = df
+        .filter(checker(foldCol) && foldCol =!= fold)
+        .drop(foldColName).rdd
+      val validation = df
+        .filter(checker(foldCol) && foldCol === fold)
+        .drop(foldColName).rdd
+      if (training.isEmpty()) {
+        throw new SparkException(s"The training data at fold $fold is empty.")
+      }
+      if (validation.isEmpty()) {
+        throw new SparkException(s"The validation data at fold $fold is empty.")
+      }
       (training, validation)
     }.toArray
   }
@@ -326,7 +361,8 @@ object MLUtils extends Logging {
         col(c)
       }
     }
-    dataset.select(exprs: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    dataset.select(exprs.toImmutableArraySeq: _*)
   }
 
   /**
@@ -378,7 +414,8 @@ object MLUtils extends Logging {
         col(c)
       }
     }
-    dataset.select(exprs: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    dataset.select(exprs.toImmutableArraySeq: _*)
   }
 
   /**
@@ -428,7 +465,8 @@ object MLUtils extends Logging {
         col(c)
       }
     }
-    dataset.select(exprs: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    dataset.select(exprs.toImmutableArraySeq: _*)
   }
 
   /**
@@ -478,7 +516,8 @@ object MLUtils extends Logging {
         col(c)
       }
     }
-    dataset.select(exprs: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    dataset.select(exprs.toImmutableArraySeq: _*)
   }
 
 
@@ -504,8 +543,10 @@ object MLUtils extends Logging {
       norm2: Double,
       precision: Double = 1e-6): Double = {
     val n = v1.size
-    require(v2.size == n)
-    require(norm1 >= 0.0 && norm2 >= 0.0)
+    require(v2.size == n,
+      s"Both vectors should have same length, found v1 is $n while v2 is ${v2.size}")
+    require(norm1 >= 0.0 && norm2 >= 0.0,
+      s"Both norms should be greater or equal to 0.0, found norm1=$norm1, norm2=$norm2")
     var sqDist = 0.0
     /*
      * The relative error is
@@ -553,5 +594,11 @@ object MLUtils extends Logging {
     } else {
       math.log1p(math.exp(x))
     }
+  }
+
+  def optimizerFailed(instr: Instrumentation, optimizerClass: Class[_]): Unit = {
+    val msg = log"${MDC(OPTIMIZER_CLASS_NAME, optimizerClass.getName)} failed."
+    instr.logError(msg)
+    throw new SparkException(msg.message)
   }
 }

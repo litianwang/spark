@@ -19,9 +19,11 @@ package org.apache.spark.sql.execution.window
 
 import scala.collection.mutable
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
+import org.apache.spark.util.ArrayImplicits._
 
 
 /**
@@ -90,13 +92,14 @@ private[window] object AggregateProcessor {
         updateExpressions ++= noOps
         evaluateExpressions += imperative
       case other =>
-        sys.error(s"Unsupported aggregate function: $other")
+        throw SparkException.internalError(s"Unsupported aggregate function: $other")
     }
 
     // Create the projections.
-    val initialProj = newMutableProjection(initialValues, partitionSize.toSeq)
-    val updateProj = newMutableProjection(updateExpressions, aggBufferAttributes ++ inputAttributes)
-    val evalProj = newMutableProjection(evaluateExpressions, aggBufferAttributes)
+    val initialProj = newMutableProjection(initialValues.toSeq, partitionSize.toSeq)
+    val updateProj =
+      newMutableProjection(updateExpressions.toSeq, (aggBufferAttributes ++ inputAttributes).toSeq)
+    val evalProj = newMutableProjection(evaluateExpressions.toSeq, aggBufferAttributes.toSeq)
 
     // Create the processor
     new AggregateProcessor(
@@ -123,7 +126,8 @@ private[window] final class AggregateProcessor(
 
   private[this] val join = new JoinedRow
   private[this] val numImperatives = imperatives.length
-  private[this] val buffer = new SpecificInternalRow(bufferSchema.toSeq.map(_.dataType))
+  private[this] val buffer =
+    new SpecificInternalRow(bufferSchema.toImmutableArraySeq.map(_.dataType))
   initialProjection.target(buffer)
   updateProjection.target(buffer)
 

@@ -20,7 +20,7 @@ package org.apache.spark.deploy
 import java.io._
 import java.util.concurrent.{Semaphore, TimeUnit}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.Path
 
@@ -73,7 +73,7 @@ object RRunner {
     @volatile var sparkRBackendSecret: String = null
     val initialized = new Semaphore(0)
     val sparkRBackendThread = new Thread("SparkR backend") {
-      override def run() {
+      override def run(): Unit = {
         val (port, authHelper) = sparkRBackend.init()
         sparkRBackendPort = port
         sparkRBackendSecret = authHelper.secret

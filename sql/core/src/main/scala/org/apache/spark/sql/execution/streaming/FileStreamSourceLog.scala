@@ -22,12 +22,10 @@ import java.util.Map.Entry
 
 import scala.collection.mutable
 
-import org.json4s.NoTypeHints
-import org.json4s.jackson.Serialization
-
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution.streaming.FileStreamSource.FileEntry
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.util.ArrayImplicits._
 
 class FileStreamSourceLog(
     metadataLogVersion: Int,
@@ -36,6 +34,7 @@ class FileStreamSourceLog(
   extends CompactibleFileStreamLog[FileEntry](metadataLogVersion, sparkSession, path) {
 
   import CompactibleFileStreamLog._
+  import FileStreamSourceLog._
 
   // Configurations about metadata compaction
   protected override val defaultCompactInterval: Int =
@@ -50,8 +49,6 @@ class FileStreamSourceLog(
 
   protected override val isDeletingExpiredLog = sparkSession.sessionState.conf.fileSourceLogDeletion
 
-  private implicit val formats = Serialization.formats(NoTypeHints)
-
   // A fixed size log entry cache to cache the file entries belong to the compaction batch. It is
   // used to avoid scanning the compacted log file to retrieve it's own batch data.
   private val cacheSize = compactInterval
@@ -59,10 +56,6 @@ class FileStreamSourceLog(
     override def removeEldestEntry(eldest: Entry[Long, Array[FileEntry]]): Boolean = {
       size() > cacheSize
     }
-  }
-
-  def compactLogs(logs: Seq[FileEntry]): Seq[FileEntry] = {
-    logs
   }
 
   override def add(batchId: Long, logs: Array[FileEntry]): Boolean = {
@@ -84,7 +77,7 @@ class FileStreamSourceLog(
       if (isCompactionBatch(id, compactInterval) && fileEntryCache.containsKey(id)) {
         (id, Some(fileEntryCache.get(id)))
       } else {
-        val logs = super.get(id).map(_.filter(_.batchId == id))
+        val logs = filterInBatch(id)(_.batchId == id)
         (id, logs)
       }
     }.partition(_._2.isDefined)
@@ -96,7 +89,7 @@ class FileStreamSourceLog(
     val searchKeys = removedBatches.map(_._1)
     val retrievedBatches = if (searchKeys.nonEmpty) {
       logWarning(s"Get batches from removed files, this is unexpected in the current code path!!!")
-      val latestBatchId = getLatest().map(_._1).getOrElse(-1L)
+      val latestBatchId = getLatestBatchId().getOrElse(-1L)
       if (latestBatchId < 0) {
         Map.empty[Long, Option[Array[FileEntry]]]
       } else {
@@ -118,12 +111,38 @@ class FileStreamSourceLog(
     val batches =
       (existedBatches ++ retrievedBatches).map(i => i._1 -> i._2.get).toArray.sortBy(_._1)
     if (startBatchId <= endBatchId) {
-      HDFSMetadataLog.verifyBatchIds(batches.map(_._1), startId, endId)
+      HDFSMetadataLog.verifyBatchIds(batches.map(_._1).toImmutableArraySeq, startId, endId)
     }
     batches
+  }
+
+  def restore(): Array[FileEntry] = {
+    val files = allFiles()
+
+    // When restarting the query, there is a case which the query starts from compaction batch,
+    // and the batch has source metadata file to read. One case is that the previous query
+    // succeeded to read from inputs, but not finalized the batch for various reasons.
+    // The below code finds the latest compaction batch, and put entries for the batch into the
+    // file entry cache which would avoid reading compact batch file twice.
+    // It doesn't know about offset / commit metadata in checkpoint so doesn't know which exactly
+    // batch to start from, but in practice, only couple of latest batches are candidates to
+    // be started. We leverage the fact to skip calculation if possible.
+    files.lastOption.foreach { lastEntry =>
+      val latestBatchId = lastEntry.batchId
+      val latestCompactedBatchId = getAllValidBatches(latestBatchId, compactInterval)(0)
+      if ((latestBatchId - latestCompactedBatchId) < PREV_NUM_BATCHES_TO_READ_IN_RESTORE) {
+        val logsForLatestCompactedBatch = files.filter { entry =>
+          entry.batchId == latestCompactedBatchId
+        }
+        fileEntryCache.put(latestCompactedBatchId, logsForLatestCompactedBatch)
+      }
+    }
+
+    files
   }
 }
 
 object FileStreamSourceLog {
   val VERSION = 1
+  val PREV_NUM_BATCHES_TO_READ_IN_RESTORE = 2
 }

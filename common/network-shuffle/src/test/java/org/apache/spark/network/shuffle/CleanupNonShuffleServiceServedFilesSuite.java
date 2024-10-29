@@ -30,11 +30,10 @@ import java.util.stream.Stream;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.util.concurrent.MoreExecutors;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.apache.spark.network.util.MapConfigProvider;
 import org.apache.spark.network.util.TransportConf;
@@ -42,7 +41,7 @@ import org.apache.spark.network.util.TransportConf;
 public class CleanupNonShuffleServiceServedFilesSuite {
 
   // Same-thread Executor used to ensure cleanup happens synchronously in test thread.
-  private Executor sameThreadExecutor = MoreExecutors.sameThreadExecutor();
+  private Executor sameThreadExecutor = Runnable::run;
 
   private static final String SORT_MANAGER = "org.apache.spark.shuffle.sort.SortShuffleManager";
 
@@ -197,7 +196,7 @@ public class CleanupNonShuffleServiceServedFilesSuite {
 
   private static void assertStillThere(TestShuffleDataContext dataContext) {
     for (String localDir : dataContext.localDirs) {
-      assertTrue(localDir + " was cleaned up prematurely", new File(localDir).exists());
+      assertTrue(new File(localDir).exists(), localDir + " was cleaned up prematurely");
     }
   }
 

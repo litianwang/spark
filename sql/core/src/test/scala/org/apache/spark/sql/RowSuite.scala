@@ -17,13 +17,13 @@
 
 package org.apache.spark.sql
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkFunSuite, SparkRuntimeException, SparkUnsupportedOperationException}
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, SpecificInternalRow}
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
-class RowSuite extends SparkFunSuite with SharedSQLContext {
+class RowSuite extends SparkFunSuite with SharedSparkSession {
   import testImplicits._
 
   test("create row") {
@@ -104,5 +104,36 @@ class RowSuite extends SparkFunSuite with SharedSQLContext {
       s"Map(1 -> a, 2 -> b),$tsString,$dtString,1234567890.1234567890,-1]")
     val empty = Row()
     assert(empty.toString == "[]")
+  }
+
+  test("SPARK-37654: row contains a null at the requested index should return null") {
+    assert(Row(Seq("value")).getSeq(0) === List("value"))
+    assert(Row(Seq()).getSeq(0) === List())
+    assert(Row(null).getSeq(0) === null)
+  }
+
+  test("access fieldIndex on Row without schema") {
+    val rowWithoutSchema = Row(1, "foo", 3.14)
+
+    checkError(
+      exception = intercept[SparkUnsupportedOperationException] {
+        rowWithoutSchema.fieldIndex("foo")
+      },
+      condition = "UNSUPPORTED_CALL.FIELD_INDEX",
+      parameters = Map("methodName" -> "fieldIndex", "className" -> "Row", "fieldName" -> "`foo`")
+    )
+  }
+
+  test("SPARK-42307: get a value from a null column should result in error") {
+    val position = 0
+    val rowWithNullValue = Row.fromSeq(Seq(null))
+
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        rowWithNullValue.getLong(position)
+      },
+      condition = "ROW_VALUE_IS_NULL",
+      parameters = Map("index" -> position.toString)
+    )
   }
 }

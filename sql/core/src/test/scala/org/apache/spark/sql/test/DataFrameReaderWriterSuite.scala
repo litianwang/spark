@@ -18,10 +18,10 @@
 package org.apache.spark.sql.test
 
 import java.io.File
-import java.util.Locale
+import java.util.{Locale, Random}
 import java.util.concurrent.ConcurrentLinkedQueue
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
@@ -32,7 +32,7 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Type.Repetition
 import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.SparkContext
+import org.apache.spark.{SparkContext, TestUtils}
 import org.apache.spark.internal.io.FileCommitProtocol.TaskCommitMessage
 import org.apache.spark.internal.io.HadoopMapReduceCommitProtocol
 import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
@@ -40,9 +40,9 @@ import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.plans.logical.{AppendData, LogicalPlan, OverwriteByExpression}
 import org.apache.spark.sql.execution.QueryExecution
-import org.apache.spark.sql.execution.datasources.DataSourceUtils
+import org.apache.spark.sql.execution.command.DataWritingCommandExec
+import org.apache.spark.sql.execution.datasources.{DataSourceUtils, HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.noop.NoopDataSource
-import org.apache.spark.sql.execution.datasources.parquet.SpecificParquetRecordReaderBase
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
@@ -142,7 +142,7 @@ class MessageCapturingCommitProtocol(jobId: String, path: String)
 }
 
 
-class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with BeforeAndAfter {
+class DataFrameReaderWriterSuite extends QueryTest with SharedSparkSession with BeforeAndAfter {
   import testImplicits._
 
   private val userSchema = new StructType().add("s", StringType)
@@ -163,9 +163,11 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
         .writeStream
         .start()
     }
-    Seq("'writeStream'", "only", "streaming Dataset/DataFrame").foreach { s =>
-      assert(e.getMessage.toLowerCase(Locale.ROOT).contains(s.toLowerCase(Locale.ROOT)))
-    }
+    checkError(
+      exception = e,
+      condition = "WRITE_STREAM_NOT_ALLOWED",
+      parameters = Map.empty
+    )
   }
 
   test("resolve default source") {
@@ -224,21 +226,147 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
     assert(LastOptions.parameters("opt3") == "3")
   }
 
-  test("pass partitionBy as options") {
-    Seq(true, false).foreach { flag =>
-      withSQLConf(SQLConf.LEGACY_PASS_PARTITION_BY_AS_OPTIONS.key -> s"$flag") {
-        Seq(1).toDF.write
-          .format("org.apache.spark.sql.test")
-          .partitionBy("col1", "col2")
-          .save()
+  test("SPARK-32364: later option should override earlier options for load()") {
+    spark.read
+      .format("org.apache.spark.sql.test")
+      .option("paTh", "1")
+      .option("PATH", "2")
+      .option("Path", "3")
+      .option("patH", "4")
+      .option("path", "5")
+      .load()
+    assert(LastOptions.parameters("path") == "5")
 
-        if (flag) {
-          val partColumns = LastOptions.parameters(DataSourceUtils.PARTITIONING_COLUMNS_KEY)
-          assert(DataSourceUtils.decodePartitioningColumns(partColumns) === Seq("col1", "col2"))
-        } else {
-          assert(!LastOptions.parameters.contains(DataSourceUtils.PARTITIONING_COLUMNS_KEY))
-        }
+    withClue("SPARK-32516: legacy path option behavior") {
+      withSQLConf(SQLConf.LEGACY_PATH_OPTION_BEHAVIOR.key -> "true") {
+        spark.read
+          .format("org.apache.spark.sql.test")
+          .option("paTh", "1")
+          .option("PATH", "2")
+          .option("Path", "3")
+          .option("patH", "4")
+          .load("5")
+        assert(LastOptions.parameters("path") == "5")
       }
+    }
+  }
+
+  test("SPARK-32364: later option should override earlier options for save()") {
+    Seq(1).toDF().write
+      .format("org.apache.spark.sql.test")
+      .option("paTh", "1")
+      .option("PATH", "2")
+      .option("Path", "3")
+      .option("patH", "4")
+      .option("path", "5")
+      .save()
+    assert(LastOptions.parameters("path") == "5")
+
+    withClue("SPARK-32516: legacy path option behavior") {
+      withSQLConf(SQLConf.LEGACY_PATH_OPTION_BEHAVIOR.key -> "true") {
+        Seq(1).toDF().write
+          .format("org.apache.spark.sql.test")
+          .option("paTh", "1")
+          .option("PATH", "2")
+          .option("Path", "3")
+          .option("patH", "4")
+          .save("5")
+        assert(LastOptions.parameters("path") == "5")
+      }
+    }
+  }
+
+  test("pass partitionBy as options") {
+    Seq(1).toDF().write
+      .format("org.apache.spark.sql.test")
+      .partitionBy("col1", "col2")
+      .save()
+
+    val partColumns = LastOptions.parameters(DataSourceUtils.PARTITIONING_COLUMNS_KEY)
+    assert(DataSourceUtils.decodePartitioningColumns(partColumns) === Seq("col1", "col2"))
+  }
+
+  test("pass clusterBy as options") {
+    Seq(1).toDF().write
+      .format("org.apache.spark.sql.test")
+      .clusterBy("col1", "col2")
+      .save()
+
+    val clusteringColumns = LastOptions.parameters(DataSourceUtils.CLUSTERING_COLUMNS_KEY)
+    assert(DataSourceUtils.decodePartitioningColumns(clusteringColumns) === Seq("col1", "col2"))
+  }
+
+  test("Clustering columns should match when appending to existing data source tables") {
+    import testImplicits._
+    val df = Seq((1, 2, 3)).toDF("a", "b", "c")
+    withTable("clusteredTable") {
+      df.write.mode("overwrite").clusterBy("a", "b").saveAsTable("clusteredTable")
+      // Misses some clustering columns
+      checkError(
+        exception = intercept[AnalysisException] {
+          df.write.mode("append").clusterBy("a").saveAsTable("clusteredTable")
+        },
+        condition = "CLUSTERING_COLUMNS_MISMATCH",
+        parameters = Map(
+          "tableName" -> "spark_catalog.default.clusteredtable",
+          "specifiedClusteringString" -> """[["a"]]""",
+          "existingClusteringString" -> """[["a"],["b"]]""")
+      )
+      // Wrong order
+      checkError(
+        exception = intercept[AnalysisException] {
+          df.write.mode("append").clusterBy("b", "a").saveAsTable("clusteredTable")
+        },
+        condition = "CLUSTERING_COLUMNS_MISMATCH",
+        parameters = Map(
+          "tableName" -> "spark_catalog.default.clusteredtable",
+          "specifiedClusteringString" -> """[["b"],["a"]]""",
+          "existingClusteringString" -> """[["a"],["b"]]""")
+      )
+      // Clustering columns not specified
+      checkError(
+        exception = intercept[AnalysisException] {
+          df.write.mode("append").saveAsTable("clusteredTable")
+        },
+        condition = "CLUSTERING_COLUMNS_MISMATCH",
+        parameters = Map(
+          "tableName" -> "spark_catalog.default.clusteredtable",
+          "specifiedClusteringString" -> "", "existingClusteringString" -> """[["a"],["b"]]""")
+      )
+      assert(sql("select * from clusteredTable").collect().length == 1)
+      // Inserts new data successfully when clustering columns are correctly specified in
+      // clusterBy(...).
+      Seq((4, 5, 6)).toDF("a", "b", "c")
+        .write
+        .mode("append")
+        .clusterBy("a", "b")
+        .saveAsTable("clusteredTable")
+
+      Seq((7, 8, 9)).toDF("a", "b", "c")
+        .write
+        .mode("append")
+        .clusterBy("a", "b")
+        .saveAsTable("clusteredTable")
+
+      checkAnswer(
+        sql("select a, b, c from clusteredTable"),
+        Row(1, 2, 3) :: Row(4, 5, 6) :: Row(7, 8, 9) :: Nil
+      )
+    }
+  }
+
+  test ("SPARK-29537: throw exception when user defined a wrong base path") {
+    withTempPath { p =>
+      val path = new Path(p.toURI).toString
+      Seq((1, 1), (2, 2)).toDF("c1", "c2")
+        .write.partitionBy("c1").mode(SaveMode.Overwrite).parquet(path)
+      val wrongBasePath = new File(p, "unknown")
+      // basePath must be a directory
+      wrongBasePath.mkdir()
+      val msg = intercept[IllegalArgumentException] {
+        spark.read.option("basePath", wrongBasePath.getCanonicalPath).parquet(path)
+      }.getMessage
+      assert(msg === s"Wrong basePath ${wrongBasePath.getCanonicalPath} for the root path: $path")
     }
   }
 
@@ -285,7 +413,7 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
         .format(classOf[NoopDataSource].getName)
         .mode(SaveMode.Append)
         .save()
-      sparkContext.listenerBus.waitUntilEmpty(1000)
+      sparkContext.listenerBus.waitUntilEmpty()
       assert(plan.isInstanceOf[AppendData])
 
       // overwrite mode creates `OverwriteByExpression`
@@ -293,24 +421,88 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
         .format(classOf[NoopDataSource].getName)
         .mode(SaveMode.Overwrite)
         .save()
-      sparkContext.listenerBus.waitUntilEmpty(1000)
+      sparkContext.listenerBus.waitUntilEmpty()
       assert(plan.isInstanceOf[OverwriteByExpression])
 
       // By default the save mode is `ErrorIfExists` for data source v2.
-      spark.range(10).write
-        .format(classOf[NoopDataSource].getName)
-        .save()
-      sparkContext.listenerBus.waitUntilEmpty(1000)
-      assert(plan.isInstanceOf[AppendData])
+      val e = intercept[AnalysisException] {
+        spark.range(10).write
+          .format(classOf[NoopDataSource].getName)
+          .save()
+      }
+      assert(e.getMessage.contains("ErrorIfExists"))
 
-      spark.range(10).write
-        .format(classOf[NoopDataSource].getName)
-        .mode("default")
-        .save()
-      sparkContext.listenerBus.waitUntilEmpty(1000)
-      assert(plan.isInstanceOf[AppendData])
+      val e2 = intercept[AnalysisException] {
+        spark.range(10).write
+          .format(classOf[NoopDataSource].getName)
+          .mode("default")
+          .save()
+      }
+      assert(e2.getMessage.contains("ErrorIfExists"))
     } finally {
       spark.listenerManager.unregister(listener)
+    }
+  }
+
+  test("Throw exception on unsafe table insertion with strict casting policy") {
+    withSQLConf(
+      SQLConf.USE_V1_SOURCE_LIST.key -> "parquet",
+      SQLConf.STORE_ASSIGNMENT_POLICY.key -> SQLConf.StoreAssignmentPolicy.STRICT.toString) {
+      withTable("t") {
+        sql("create table t(i int, d double) using parquet")
+        // Calling `saveAsTable` to an existing table with append mode results in table insertion.
+        checkError(
+          exception = intercept[AnalysisException] {
+            Seq((1L, 2.0)).toDF("i", "d").write.mode("append").saveAsTable("t")
+          },
+          condition = "INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_SAFELY_CAST",
+          parameters = Map(
+            "tableName" -> "`spark_catalog`.`default`.`t`",
+            "colName" -> "`i`",
+            "srcType" -> "\"BIGINT\"",
+            "targetType" -> "\"INT\"")
+        )
+
+        // Insert into table successfully.
+        Seq((1, 2.0)).toDF("i", "d").write.mode("append").saveAsTable("t")
+        // The API `saveAsTable` matches the fields by name.
+        Seq((4.0, 3)).toDF("d", "i").write.mode("append").saveAsTable("t")
+        checkAnswer(sql("select * from t"), Seq(Row(1, 2.0), Row(3, 4.0)))
+      }
+    }
+  }
+
+  test("Throw exception on unsafe cast with ANSI casting policy") {
+    withSQLConf(
+      SQLConf.USE_V1_SOURCE_LIST.key -> "parquet",
+      SQLConf.STORE_ASSIGNMENT_POLICY.key -> SQLConf.StoreAssignmentPolicy.ANSI.toString) {
+      withTable("t") {
+        sql("create table t(i int, d double) using parquet")
+        // Calling `saveAsTable` to an existing table with append mode results in table insertion.
+        checkError(
+          exception = intercept[AnalysisException] {
+            Seq(("a", "b")).toDF("i", "d").write.mode("append").saveAsTable("t")
+          },
+          condition = "INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_SAFELY_CAST",
+          parameters = Map(
+            "tableName" -> "`spark_catalog`.`default`.`t`",
+            "colName" -> "`i`",
+            "srcType" -> "\"STRING\"",
+            "targetType" -> "\"INT\"")
+        )
+
+        checkError(
+          exception = intercept[AnalysisException] {
+            Seq((true, false)).toDF("i", "d").write.mode("append").saveAsTable("t")
+          },
+          condition = "INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_SAFELY_CAST",
+          parameters = Map(
+            "tableName" -> "`spark_catalog`.`default`.`t`",
+            "colName" -> "`i`",
+            "srcType" -> "\"BOOLEAN\"",
+            "targetType" -> "\"INT\"")
+        )
+      }
     }
   }
 
@@ -367,7 +559,7 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
     assert(LastOptions.parameters("doubleOpt") == "6.7")
   }
 
-  test("check jdbc() does not support partitioning, bucketBy or sortBy") {
+  test("check jdbc() does not support partitioning, bucketBy, clusterBy or sortBy") {
     val df = spark.read.text(Utils.createTempDir(namePrefix = "text").getCanonicalPath)
 
     var w = df.write.partitionBy("value")
@@ -379,6 +571,12 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
     w = df.write.bucketBy(2, "value")
     e = intercept[AnalysisException](w.jdbc(null, null, null))
     Seq("jdbc", "does not support bucketBy right now").foreach { s =>
+      assert(e.getMessage.toLowerCase(Locale.ROOT).contains(s.toLowerCase(Locale.ROOT)))
+    }
+
+    w = df.write.clusterBy("value")
+    e = intercept[AnalysisException](w.jdbc(null, null, null))
+    Seq("jdbc", "clustering").foreach { s =>
       assert(e.getMessage.toLowerCase(Locale.ROOT).contains(s.toLowerCase(Locale.ROOT)))
     }
 
@@ -417,7 +615,7 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
 
   test("write path implements onTaskCommit API correctly") {
     withSQLConf(
-        "spark.sql.sources.commitProtocolClass" ->
+        SQLConf.FILE_COMMIT_PROTOCOL_CLASS.key ->
           classOf[MessageCapturingCommitProtocol].getCanonicalName) {
       withTempDir { dir =>
         val path = dir.getCanonicalPath
@@ -434,14 +632,32 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
       .option("TO", "10")
       .format("org.apache.spark.sql.sources.SimpleScanSource")
 
-    // when users do not specify the schema
-    checkAnswer(dfReader.load(), spark.range(1, 11).toDF())
+    val answerDf = spark.range(1, 11).toDF()
 
-    // when users specify the schema
-    val inputSchema = new StructType().add("s", IntegerType, nullable = false)
-    val e = intercept[AnalysisException] { dfReader.schema(inputSchema).load() }
-    assert(e.getMessage.contains(
-      "org.apache.spark.sql.sources.SimpleScanSource does not allow user-specified schemas"))
+    // when users do not specify the schema
+    checkAnswer(dfReader.load(), answerDf)
+
+    // same base schema, differing metadata and nullability
+    val fooBarMetadata = new MetadataBuilder().putString("foo", "bar").build()
+    val nullableAndMetadataCases = Seq(
+      (false, fooBarMetadata),
+      (false, Metadata.empty),
+      (true, fooBarMetadata),
+      (true, Metadata.empty))
+    nullableAndMetadataCases.foreach { case (nullable, metadata) =>
+      val inputSchema = new StructType()
+        .add("i", IntegerType, nullable = nullable, metadata = metadata)
+      checkAnswer(dfReader.schema(inputSchema).load(), answerDf)
+    }
+
+    // when users specify a wrong schema
+    var inputSchema = new StructType().add("s", IntegerType, nullable = false)
+    var e = intercept[AnalysisException] { dfReader.schema(inputSchema).load() }
+    assert(e.getMessage.contains("The user-specified schema doesn't match the actual schema"))
+
+    inputSchema = new StructType().add("i", StringType, nullable = true)
+    e = intercept[AnalysisException] { dfReader.schema(inputSchema).load() }
+    assert(e.getMessage.contains("The user-specified schema doesn't match the actual schema"))
   }
 
   test("read a data source that does not extend RelationProvider") {
@@ -508,10 +724,13 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
     val schema = df.schema
 
     // Reader, without user specified schema
-    val message = intercept[AnalysisException] {
-      testRead(spark.read.csv(), Seq.empty, schema)
-    }.getMessage
-    assert(message.contains("Unable to infer schema for CSV. It must be specified manually."))
+    checkError(
+      exception = intercept[AnalysisException] {
+        testRead(spark.read.csv(), Seq.empty, schema)
+      },
+      condition = "UNABLE_TO_INFER_SCHEMA",
+      parameters = Map("format" -> "CSV")
+    )
 
     testRead(spark.read.csv(dir), data, schema)
     testRead(spark.read.csv(dir, dir), data ++ data, schema)
@@ -644,7 +863,7 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
     withTempPath { dir =>
       val path = dir.getAbsolutePath
       df.write.mode("overwrite").parquet(path)
-      val file = SpecificParquetRecordReaderBase.listDirectory(dir).get(0)
+      val file = TestUtils.listDirectory(dir).head
 
       val hadoopInputFile = HadoopInputFile.fromPath(new Path(file), new Configuration())
       val f = ParquetFileReader.open(hadoopInputFile)
@@ -761,7 +980,8 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
       val createArray = udf { (length: Long) =>
         for (i <- 1 to length.toInt) yield i.toString
       }
-      spark.range(4).select(createArray('id + 1) as 'ex, 'id, 'id % 4 as 'part).coalesce(1).write
+      spark.range(4).select(createArray($"id" + 1) as Symbol("ex"),
+        $"id", $"id" % 4 as Symbol("part")).coalesce(1).write
         .partitionBy("part", "id")
         .mode("overwrite")
         .parquet(src.toString)
@@ -842,15 +1062,18 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
   test("SPARK-20460 Check name duplication in buckets") {
     Seq((true, ("a", "a")), (false, ("aA", "Aa"))).foreach { case (caseSensitive, (c0, c1)) =>
       withSQLConf(SQLConf.CASE_SENSITIVE.key -> caseSensitive.toString) {
-        var errorMsg = intercept[AnalysisException] {
-          Seq((1, 1)).toDF("col", c0).write.bucketBy(2, c0, c1).saveAsTable("t")
-        }.getMessage
-        assert(errorMsg.contains("Found duplicate column(s) in the bucket definition"))
-
-        errorMsg = intercept[AnalysisException] {
-          Seq((1, 1)).toDF("col", c0).write.bucketBy(2, "col").sortBy(c0, c1).saveAsTable("t")
-        }.getMessage
-        assert(errorMsg.contains("Found duplicate column(s) in the sort definition"))
+        checkError(
+          exception = intercept[AnalysisException] {
+            Seq((1, 1)).toDF("col", c0).write.bucketBy(2, c0, c1).saveAsTable("t")
+          },
+          condition = "COLUMN_ALREADY_EXISTS",
+          parameters = Map("columnName" -> s"`${c1.toLowerCase(Locale.ROOT)}`"))
+        checkError(
+          exception = intercept[AnalysisException] {
+            Seq((1, 1)).toDF("col", c0).write.bucketBy(2, "col").sortBy(c0, c1).saveAsTable("t")
+          },
+          condition = "COLUMN_ALREADY_EXISTS",
+          parameters = Map("columnName" -> s"`${c1.toLowerCase(Locale.ROOT)}`"))
       }
     }
   }
@@ -858,22 +1081,26 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
   test("SPARK-20460 Check name duplication in schema") {
     def checkWriteDataColumnDuplication(
         format: String, colName0: String, colName1: String, tempDir: File): Unit = {
-      val errorMsg = intercept[AnalysisException] {
-        Seq((1, 1)).toDF(colName0, colName1).write.format(format).mode("overwrite")
-          .save(tempDir.getAbsolutePath)
-      }.getMessage
-      assert(errorMsg.contains("Found duplicate column(s) when inserting into"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          Seq((1, 1)).toDF(colName0, colName1).write.format(format).mode("overwrite")
+            .save(tempDir.getAbsolutePath)
+        },
+        condition = "COLUMN_ALREADY_EXISTS",
+        parameters = Map("columnName" -> s"`${colName1.toLowerCase(Locale.ROOT)}`"))
     }
 
     def checkReadUserSpecifiedDataColumnDuplication(
         df: DataFrame, format: String, colName0: String, colName1: String, tempDir: File): Unit = {
       val testDir = Utils.createTempDir(tempDir.getAbsolutePath)
       df.write.format(format).mode("overwrite").save(testDir.getAbsolutePath)
-      val errorMsg = intercept[AnalysisException] {
-        spark.read.format(format).schema(s"$colName0 INT, $colName1 INT")
-          .load(testDir.getAbsolutePath)
-      }.getMessage
-      assert(errorMsg.contains("Found duplicate column(s) in the data schema:"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          spark.read.format(format).schema(s"$colName0 INT, $colName1 INT")
+            .load(testDir.getAbsolutePath)
+        },
+        condition = "COLUMN_ALREADY_EXISTS",
+        parameters = Map("columnName" -> s"`${colName1.toLowerCase(Locale.ROOT)}`"))
     }
 
     def checkReadPartitionColumnDuplication(
@@ -881,17 +1108,18 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
       val testDir = Utils.createTempDir(tempDir.getAbsolutePath)
       Seq(1).toDF("col").write.format(format).mode("overwrite")
         .save(s"${testDir.getAbsolutePath}/$colName0=1/$colName1=1")
-      val errorMsg = intercept[AnalysisException] {
-        spark.read.format(format).load(testDir.getAbsolutePath)
-      }.getMessage
-      assert(errorMsg.contains("Found duplicate column(s) in the partition schema:"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          spark.read.format(format).load(testDir.getAbsolutePath)
+        },
+        condition = "COLUMN_ALREADY_EXISTS",
+        parameters = Map("columnName" -> s"`${colName1.toLowerCase(Locale.ROOT)}`"))
     }
 
     Seq((true, ("a", "a")), (false, ("aA", "Aa"))).foreach { case (caseSensitive, (c0, c1)) =>
       withSQLConf(SQLConf.CASE_SENSITIVE.key -> caseSensitive.toString) {
         withTempDir { src =>
           // Check CSV format
-          checkWriteDataColumnDuplication("csv", c0, c1, src)
           checkReadUserSpecifiedDataColumnDuplication(
             Seq((1, 1)).toDF("c0", "c1"), "csv", c0, c1, src)
           // If `inferSchema` is true, a CSV format is duplicate-safe (See SPARK-16896)
@@ -910,10 +1138,12 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
           testDir = Utils.createTempDir(src.getAbsolutePath)
           Seq(s"""{"$c0":3, "$c1":5}""").toDF().write.mode("overwrite")
             .text(testDir.getAbsolutePath)
-          val errorMsg = intercept[AnalysisException] {
-            spark.read.format("json").option("inferSchema", true).load(testDir.getAbsolutePath)
-          }.getMessage
-          assert(errorMsg.contains("Found duplicate column(s) in the data schema:"))
+          checkError(
+            exception = intercept[AnalysisException] {
+              spark.read.format("json").option("inferSchema", true).load(testDir.getAbsolutePath)
+            },
+            condition = "COLUMN_ALREADY_EXISTS",
+            parameters = Map("columnName" -> s"`${c1.toLowerCase(Locale.ROOT)}`"))
           checkReadPartitionColumnDuplication("json", c0, c1, src)
 
           // Check Parquet format
@@ -1012,7 +1242,8 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
         val jobDescriptions = new ConcurrentLinkedQueue[String]()
         val jobListener = new SparkListener {
           override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
-            jobDescriptions.add(jobStart.properties.getProperty(SparkContext.SPARK_JOB_DESCRIPTION))
+            val desc = jobStart.properties.getProperty(SparkContext.SPARK_JOB_DESCRIPTION)
+            if (desc != null) jobDescriptions.add(desc)
           }
         }
         sparkContext.addSparkListener(jobListener)
@@ -1023,7 +1254,7 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
           checkDatasetUnorderly(
             spark.read.parquet(dir.getCanonicalPath).as[(Long, Long)],
             0L -> 0L, 1L -> 1L, 2L -> 2L)
-          sparkContext.listenerBus.waitUntilEmpty(10000)
+          sparkContext.listenerBus.waitUntilEmpty()
           assert(jobDescriptions.asScala.toList.exists(
             _.contains("Listing leaf files and directories for 3 paths")))
         } finally {
@@ -1031,5 +1262,187 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSQLContext with Be
         }
       }
     }
+  }
+
+  test("SPARK-32516: 'path' or 'paths' option cannot coexist with load()'s path parameters") {
+    def verifyLoadFails(f: => DataFrame): Unit = {
+      val e = intercept[AnalysisException](f)
+      assert(e.getMessage.contains(
+        "Either remove the path option if it's the same as the path parameter"))
+    }
+
+    val path = "/tmp"
+    verifyLoadFails(spark.read.option("path", path).parquet(path))
+    verifyLoadFails(spark.read.option("path", path).parquet(""))
+    verifyLoadFails(spark.read.option("path", path).format("parquet").load(path))
+    verifyLoadFails(spark.read.option("path", path).format("parquet").load(""))
+    verifyLoadFails(spark.read.option("paths", path).parquet(path))
+    verifyLoadFails(spark.read.option("paths", path).parquet(""))
+    verifyLoadFails(spark.read.option("paths", path).format("parquet").load(path))
+    verifyLoadFails(spark.read.option("paths", path).format("parquet").load(""))
+  }
+
+  test("SPARK-32516: legacy path option behavior in load()") {
+    withSQLConf(SQLConf.LEGACY_PATH_OPTION_BEHAVIOR.key -> "true") {
+      withTempDir { dir =>
+        val path = dir.getCanonicalPath
+        Seq(1).toDF().write.mode("overwrite").parquet(path)
+
+        // When there is one path parameter to load(), "path" option is overwritten.
+        checkAnswer(spark.read.format("parquet").option("path", path).load(path), Row(1))
+
+        // When there are multiple path parameters to load(), "path" option is added.
+        checkAnswer(
+          spark.read.format("parquet").option("path", path).load(path, path),
+          Seq(Row(1), Row(1), Row(1)))
+
+        // When built-in datasource functions are invoked (e.g, `csv`, `parquet`, etc.),
+        // the path option is always added regardless of the number of path parameters.
+        checkAnswer(spark.read.option("path", path).parquet(path), Seq(Row(1), Row(1)))
+        checkAnswer(
+          spark.read.option("path", path).parquet(path, path),
+          Seq(Row(1), Row(1), Row(1)))
+      }
+    }
+  }
+
+  test("SPARK-32516: 'path' option cannot coexist with save()'s path parameter") {
+    def verifyLoadFails(f: => Unit): Unit = {
+      val e = intercept[AnalysisException](f)
+      assert(e.getMessage.contains(
+        "Either remove the path option, or call save() without the parameter"))
+    }
+
+    val df = Seq(1).toDF()
+    val path = "tmp"
+    verifyLoadFails(df.write.option("path", path).parquet(path))
+    verifyLoadFails(df.write.option("path", path).parquet(""))
+    verifyLoadFails(df.write.option("path", path).format("parquet").save(path))
+    verifyLoadFails(df.write.option("path", path).format("parquet").save(""))
+  }
+
+  test("SPARK-32853: consecutive load/save calls should be allowed") {
+    val dfr = spark.read.format(classOf[FakeSourceOne].getName)
+    dfr.load("1")
+    dfr.load("2")
+    val dfw = spark.range(10).write.format(classOf[DefaultSource].getName)
+    dfw.save("1")
+    dfw.save("2")
+  }
+
+  test("SPARK-32844: DataFrameReader.table take the specified options for V1 relation") {
+    withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> "parquet") {
+      withTable("t") {
+        sql("CREATE TABLE t(i int, d double) USING parquet OPTIONS ('p1'='v1', 'p2'='v2')")
+
+        val msg = intercept[AnalysisException] {
+          spark.read.option("P1", "v3").table("t").count()
+        }.getMessage
+        assert(msg.contains("duplicated key"))
+
+        val df = spark.read.option("P2", "v2").option("p3", "v3").table("t")
+        val options = df.queryExecution.analyzed.collectFirst {
+          case r: LogicalRelation => r.relation.asInstanceOf[HadoopFsRelation].options
+        }.get
+        assert(options("p2") == "v2")
+        assert(options("p3") == "v3")
+      }
+    }
+  }
+
+  test("SPARK-26164: Allow concurrent writers for multiple partitions and buckets") {
+    withTable("t1", "t2") {
+      // Uses fixed seed to ensure reproducible test execution
+      val r = new Random(31)
+      val df = spark.range(200).map(_ => {
+        val n = r.nextInt()
+        (n, n.toString, n % 5)
+      }).toDF("k1", "k2", "part")
+      df.write.format("parquet").saveAsTable("t1")
+      spark.sql("CREATE TABLE t2(k1 int, k2 string, part int) USING parquet PARTITIONED " +
+        "BY (part) CLUSTERED BY (k1) INTO 3 BUCKETS")
+      val queryToInsertTable = "INSERT OVERWRITE TABLE t2 SELECT k1, k2, part FROM t1"
+
+      Seq(
+        // Single writer
+        0,
+        // Concurrent writers without fallback
+        200,
+        // concurrent writers with fallback
+        3
+      ).foreach { maxWriters =>
+        withSQLConf(SQLConf.MAX_CONCURRENT_OUTPUT_FILE_WRITERS.key -> maxWriters.toString) {
+          spark.sql(queryToInsertTable).collect()
+          checkAnswer(spark.table("t2").orderBy("k1"),
+            spark.table("t1").orderBy("k1"))
+
+          withSQLConf(SQLConf.MAX_RECORDS_PER_FILE.key -> "1") {
+            spark.sql(queryToInsertTable).collect()
+            checkAnswer(spark.table("t2").orderBy("k1"),
+              spark.table("t1").orderBy("k1"))
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-43281: Fix concurrent writer does not update file metrics") {
+    withTable("t") {
+      withSQLConf(SQLConf.MAX_CONCURRENT_OUTPUT_FILE_WRITERS.key -> "3",
+          SQLConf.LEAF_NODE_DEFAULT_PARALLELISM.key -> "1") {
+        spark.sql("CREATE TABLE t(c int) USING parquet PARTITIONED BY (p String)")
+        var dataWriting: DataWritingCommandExec = null
+        val listener = new QueryExecutionListener {
+          override def onFailure(f: String, qe: QueryExecution, e: Exception): Unit = {}
+          override def onSuccess(funcName: String, qe: QueryExecution, duration: Long): Unit = {
+            qe.executedPlan match {
+              case dataWritingCommandExec: DataWritingCommandExec =>
+                dataWriting = dataWritingCommandExec
+              case _ =>
+            }
+          }
+        }
+        spark.listenerManager.register(listener)
+
+        def checkMetrics(sqlStr: String, numFiles: Int, numOutputRows: Long): Unit = {
+          sql(sqlStr)
+          sparkContext.listenerBus.waitUntilEmpty()
+          assert(dataWriting != null)
+          val metrics = dataWriting.cmd.metrics
+          assert(metrics.contains("numFiles"))
+          assert(metrics("numFiles").value == numFiles)
+          assert(metrics.contains("numOutputBytes"))
+          assert(metrics("numOutputBytes").value > 0)
+          assert(metrics.contains("numOutputRows"))
+          assert(metrics("numOutputRows").value == numOutputRows)
+        }
+
+        try {
+          // without fallback
+          checkMetrics(
+            "INSERT INTO TABLE t PARTITION(p) SELECT * FROM VALUES(1, 'a'),(2, 'a'),(1, 'b')",
+            numFiles = 2,
+            numOutputRows = 3)
+
+          // with fallback
+          checkMetrics(
+            """
+              |INSERT INTO TABLE t PARTITION(p)
+              |SELECT * FROM VALUES(1, 'a'),(2, 'b'),(1, 'c'),(2, 'd')""".stripMargin,
+            numFiles = 4,
+            numOutputRows = 4)
+        } finally {
+          spark.listenerManager.unregister(listener)
+        }
+      }
+    }
+  }
+
+  test("SPARK-39910: read files from Hadoop archives") {
+    val fileSchema = new StructType().add("str", StringType)
+    val harPath = testFile("test-data/test-archive.har")
+      .replaceFirst("file:/", "har:/")
+
+    testRead(spark.read.schema(fileSchema).csv(s"$harPath/test.csv"), data, fileSchema)
   }
 }

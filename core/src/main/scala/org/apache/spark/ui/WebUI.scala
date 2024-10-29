@@ -18,18 +18,19 @@
 package org.apache.spark.ui
 
 import java.util.EnumSet
-import javax.servlet.DispatcherType
-import javax.servlet.http.{HttpServlet, HttpServletRequest}
 
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.mutable.HashMap
 import scala.xml.Node
 
+import jakarta.servlet.DispatcherType
+import jakarta.servlet.http.{HttpServlet, HttpServletRequest}
 import org.eclipse.jetty.servlet.{FilterHolder, FilterMapping, ServletContextHandler, ServletHolder}
 import org.json4s.JsonAST.{JNothing, JValue}
 
 import org.apache.spark.{SecurityManager, SparkConf, SSLOptions}
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config._
 import org.apache.spark.ui.JettyUtils._
 import org.apache.spark.util.Utils
@@ -46,7 +47,8 @@ private[spark] abstract class WebUI(
     port: Int,
     conf: SparkConf,
     basePath: String = "",
-    name: String = "")
+    name: String = "",
+    poolSize: Int = 200)
   extends Logging {
 
   protected val tabs = ArrayBuffer[WebUITab]()
@@ -55,14 +57,14 @@ private[spark] abstract class WebUI(
   protected var serverInfo: Option[ServerInfo] = None
   protected val publicHostName = Option(conf.getenv("SPARK_PUBLIC_DNS")).getOrElse(
     conf.get(DRIVER_HOST_ADDRESS))
-  private val className = Utils.getFormattedClassName(this)
+  protected val className = Utils.getFormattedClassName(this)
 
   def getBasePath: String = basePath
-  def getTabs: Seq[WebUITab] = tabs
-  def getHandlers: Seq[ServletContextHandler] = handlers
+  def getTabs: Seq[WebUITab] = tabs.toSeq
+  def getHandlers: Seq[ServletContextHandler] = handlers.toSeq
 
   def getDelegatingHandlers: Seq[DelegatingServletContextHandler] = {
-    handlers.map(new DelegatingServletContextHandler(_))
+    handlers.map(new DelegatingServletContextHandler(_)).toSeq
   }
 
   /** Attaches a tab to this UI, along with all of its attached pages. */
@@ -93,6 +95,7 @@ private[spark] abstract class WebUI(
     attachHandler(renderJsonHandler)
     val handlers = pageToHandlers.getOrElseUpdate(page, ArrayBuffer[ServletContextHandler]())
     handlers += renderHandler
+    handlers += renderJsonHandler
   }
 
   /** Attaches a handler to this UI. */
@@ -137,18 +140,27 @@ private[spark] abstract class WebUI(
   /** A hook to initialize components of the UI */
   def initialize(): Unit
 
+  def initServer(): ServerInfo = {
+    val hostName = Option(conf.getenv("SPARK_LOCAL_IP"))
+        .getOrElse(if (Utils.preferIPv6) "[::]" else "0.0.0.0")
+    val server = startJettyServer(hostName, port, sslOptions, conf, name, poolSize)
+    server
+  }
+
   /** Binds to the HTTP server behind this web interface. */
   def bind(): Unit = {
     assert(serverInfo.isEmpty, s"Attempted to bind $className more than once!")
     try {
-      val host = Option(conf.getenv("SPARK_LOCAL_IP")).getOrElse("0.0.0.0")
-      val server = startJettyServer(host, port, sslOptions, conf, name)
+      val server = initServer()
       handlers.foreach(server.addHandler(_, securityManager))
       serverInfo = Some(server)
-      logInfo(s"Bound $className to $host, and started at $webUrl")
+      val hostName = Option(conf.getenv("SPARK_LOCAL_IP"))
+          .getOrElse(if (Utils.preferIPv6) "[::]" else "0.0.0.0")
+      logInfo(log"Bound ${MDC(CLASS_NAME, className)} to ${MDC(HOST, hostName)}," +
+        log" and started at ${MDC(WEB_URL, webUrl)}")
     } catch {
       case e: Exception =>
-        logError(s"Failed to bind $className", e)
+        logError(log"Failed to bind ${MDC(CLASS_NAME, className)}", e)
         System.exit(1)
     }
   }
@@ -183,15 +195,17 @@ private[spark] abstract class WebUITab(parent: WebUI, val prefix: String) {
   val name = prefix.capitalize
 
   /** Attach a page to this tab. This prepends the page's prefix with the tab's own prefix. */
-  def attachPage(page: WebUIPage) {
+  def attachPage(page: WebUIPage): Unit = {
     page.prefix = (prefix + "/" + page.prefix).stripSuffix("/")
     pages += page
   }
 
-  /** Get a list of header tabs from the parent UI. */
-  def headerTabs: Seq[WebUITab] = parent.getTabs
+  /** Get a list of header tabs from the parent UI sorted by displayOrder. */
+  def headerTabs: Seq[WebUITab] = parent.getTabs.sortBy(_.displayOrder)
 
   def basePath: String = parent.getBasePath
+
+  def displayOrder: Int = Integer.MIN_VALUE
 }
 
 
@@ -234,5 +248,9 @@ private[spark] class DelegatingServletContextHandler(handler: ServletContextHand
 
   def filterCount(): Int = {
     handler.getServletHandler.getFilters.length
+  }
+
+  def getContextPath(): String = {
+    handler.getContextPath
   }
 }

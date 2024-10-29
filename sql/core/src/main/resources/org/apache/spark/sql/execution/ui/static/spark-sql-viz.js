@@ -15,11 +15,20 @@
  * limitations under the License.
  */
 
+/* global $, d3, dagreD3, graphlibDot */
+
 var PlanVizConstants = {
   svgMarginX: 16,
   svgMarginY: 16
 };
 
+/* eslint-disable no-unused-vars */
+function shouldRenderPlanViz() {
+  return planVizContainer().selectAll("svg").empty();
+}
+/* eslint-enable no-unused-vars */
+
+/* eslint-disable no-unused-vars */
 function renderPlanViz() {
   var svg = planVizContainer().append("svg");
   var metadata = d3.select("#plan-viz-metadata");
@@ -37,13 +46,13 @@ function renderPlanViz() {
     .attr("rx", "5")
     .attr("ry", "5");
 
-  var nodeSize = parseInt($("#plan-viz-metadata-size").text());
-  for (var i = 0; i < nodeSize; i++) {
-    setupTooltipForSparkPlanNode(i);
-  }
-
+  setupLayoutForSparkPlanCluster(g, svg);
+  setupSelectionForSparkPlanNode(g);
+  setupTooltipForSparkPlanNode(g);
   resizeSvg(svg);
+  postprocessForAdditionalMetrics();
 }
+/* eslint-enable no-unused-vars */
 
 /* -------------------- *
  * | Helper functions | *
@@ -55,21 +64,49 @@ function planVizContainer() { return d3.select("#plan-viz-graph"); }
  * Set up the tooltip for a SparkPlan node using metadata. When the user moves the mouse on the
  * node, it will display the details of this SparkPlan node in the right.
  */
-function setupTooltipForSparkPlanNode(nodeId) {
-  var nodeTooltip = d3.select("#plan-meta-data-" + nodeId).text()
-  d3.select("svg g .node_" + nodeId)
-    .on('mouseover', function(d) {
-      var domNode = d3.select(this).node();
-      $(domNode).tooltip({
-        title: nodeTooltip, trigger: "manual", container: "body", placement: "right"
+function setupTooltipForSparkPlanNode(g) {
+  g.nodes().forEach(function (v) {
+    const node = g.node(v);
+    d3.select("svg g #" + node.id).each(function () {
+      $(this).tooltip({
+        title: node.tooltip, trigger: "hover focus", container: "body", placement: "top"
       });
-      $(domNode).tooltip("show");
-    })
-    .on('mouseout', function(d) {
-      var domNode = d3.select(this).node();
-      $(domNode).tooltip("destroy");
-    })
+    });
+  });
 }
+
+/*
+ * Set up the layout for SparkPlan cluster.
+ * By default, the label of a cluster is placed in the middle of the cluster. This function moves
+ * the label to the right top corner of the cluster and expands the cluster to fit the label.
+ */
+function setupLayoutForSparkPlanCluster(g, svg) {
+  g.nodes().filter((v) => g.node(v).isCluster).forEach((v) => {
+    const node = g.node(v);
+    const cluster = svg.select("#" + node.id);
+    const labelGroup = cluster.select(".label");
+    const bbox = labelGroup.node().getBBox();
+    const rect = cluster.select("rect");
+    const oldWidth = parseFloat(rect.attr("width"));
+    const newWidth = Math.max(oldWidth, bbox.width) + 10;
+    const oldHeight = parseFloat(rect.attr("height"));
+    const newHeight = oldHeight + bbox.height;
+    rect
+      .attr("width", (_ignored_i) => newWidth)
+      .attr("height", (_ignored_i) => newHeight)
+      .attr("x", (_ignored_i) => parseFloat(rect.attr("x")) - (newWidth - oldWidth) / 2)
+      .attr("y", (_ignored_i) => parseFloat(rect.attr("y")) - (newHeight - oldHeight) / 2);
+
+    labelGroup
+      .select("g")
+      .attr("text-anchor", "end")
+      .attr("transform", "translate(" + (newWidth / 2 - 5) + "," + (-newHeight / 2 + 5) + ")");
+  })
+}
+
+// labelSeparator should be a non-graphical character in order not to affect the width of boxes.
+var labelSeparator = "\x01";
+var stageAndTaskMetricsPattern = "^(.*)(\\(stage.*task[^)]*\\))(.*)$";
 
 /*
  * Helper function to pre-process the graph layout.
@@ -77,17 +114,38 @@ function setupTooltipForSparkPlanNode(nodeId) {
  * and sizes of graph elements, e.g. padding, font style, shape.
  */
 function preprocessGraphLayout(g) {
-  var nodes = g.nodes();
-  for (var i = 0; i < nodes.length; i++) {
-      var node = g.node(nodes[i]);
-      node.padding = "5";
-  }
+  g.graph().ranksep = "70";
+  g.nodes().forEach(function (v) {
+    const node = g.node(v);
+    node.padding = "5";
+
+    var firstSeparator;
+    var secondSeparator;
+    var splitter;
+    if (node.isCluster) {
+      firstSeparator = secondSeparator = labelSeparator;
+      splitter = "\\n";
+    } else {
+      firstSeparator = "<span class='stageId-and-taskId-metrics'>";
+      secondSeparator = "</span>";
+      splitter = "<br>";
+    }
+
+    node.label.split(splitter).forEach(function(text, _ignored_i) {
+      var newTexts = text.match(stageAndTaskMetricsPattern);
+      if (newTexts) {
+        node.label = node.label.replace(
+          newTexts[0],
+          newTexts[1] + firstSeparator + newTexts[2] + secondSeparator + newTexts[3]);
+      }
+    });
+  });
   // Curve the edges
-  var edges = g.edges();
-  for (var j = 0; j < edges.length; j++) {
-    var edge = g.edge(edges[j]);
-    edge.lineInterpolate = "basis";
-  }
+  g.edges().forEach(function (edge) {
+    g.setEdge(edge.v, edge.w, {
+      curve: d3.curveBasis
+    })
+  })
 }
 
 /*
@@ -95,11 +153,9 @@ function preprocessGraphLayout(g) {
  * This assumes that all outermost elements are clusters (rectangles).
  */
 function resizeSvg(svg) {
-  var allClusters = svg.selectAll("g rect")[0];
-  console.log(allClusters);
+  var allClusters = svg.selectAll("g rect").nodes();
   var startX = -PlanVizConstants.svgMarginX +
     toFloat(d3.min(allClusters, function(e) {
-      console.log(e);
       return getAbsolutePosition(d3.select(e)).x;
     }));
   var startY = -PlanVizConstants.svgMarginY +
@@ -145,16 +201,114 @@ function getAbsolutePosition(d3selection) {
   while (!obj.empty()) {
     var transformText = obj.attr("transform");
     if (transformText) {
-      var translate = d3.transform(transformText).translate;
+      var translate = transformText.substring("translate(".length, transformText.length - 1).split(",")
       _x += toFloat(translate[0]);
       _y += toFloat(translate[1]);
     }
     // Climb upwards to find how our parents are translated
     obj = d3.select(obj.node().parentNode);
     // Stop when we've reached the graph container itself
-    if (obj.node() == planVizContainer().node()) {
+    if (obj.node() === planVizContainer().node()) {
       break;
     }
   }
   return { x: _x, y: _y };
+}
+
+/*
+ * Helper function for postprocess for additional metrics.
+ */
+function postprocessForAdditionalMetrics() {
+  // With dagre-d3, we can choose normal text (default) or HTML as a label type.
+  // HTML label for node works well but not for cluster so we need to choose the default label type
+  // and manipulate DOM.
+  $("g.cluster text tspan")
+    .each(function() {
+      var originalText = $(this).text();
+      if (originalText.indexOf(labelSeparator) > 0) {
+        var newTexts = originalText.split(labelSeparator);
+        var thisD3Node = d3.selectAll($(this));
+        thisD3Node.text(newTexts[0]);
+        thisD3Node.append("tspan").attr("class", "stageId-and-taskId-metrics").text(newTexts[1]);
+        $(this).append(newTexts[2]);
+      } else {
+        return originalText;
+      }
+    });
+
+  var checkboxNode = $("#stageId-and-taskId-checkbox");
+  checkboxNode.click(function() {
+    onClickAdditionalMetricsCheckbox($(this));
+  });
+  var isChecked = window.localStorage.getItem("stageId-and-taskId-checked") === "true";
+  checkboxNode.prop("checked", isChecked);
+  onClickAdditionalMetricsCheckbox(checkboxNode);
+}
+
+/*
+ * Helper function which defines the action on click the checkbox.
+ */
+function onClickAdditionalMetricsCheckbox(checkboxNode) {
+  var additionalMetrics = $(".stageId-and-taskId-metrics");
+  var isChecked = checkboxNode.prop("checked");
+  if (isChecked) {
+    additionalMetrics.show();
+  } else {
+    additionalMetrics.hide();
+  }
+  window.localStorage.setItem("stageId-and-taskId-checked", isChecked);
+}
+
+function togglePlanViz() { // eslint-disable-line no-unused-vars
+  const arrow = d3.select("#plan-viz-graph-arrow");
+  arrow.each(function () {
+    $(this).toggleClass("arrow-open").toggleClass("arrow-closed")
+  });
+  if (arrow.classed("arrow-open")) {
+    planVizContainer().style("display", "block");
+  } else {
+    planVizContainer().style("display", "none");
+  }
+}
+
+/*
+ * Light up the selected node and its linked nodes and edges.
+ */
+function setupSelectionForSparkPlanNode(g) {
+  const linkedNodes = new Map();
+  const linkedEdges = new Map();
+
+  g.edges().forEach(function (e) {
+    const edge = g.edge(e);
+    const from = g.node(e.v);
+    const to = g.node(e.w);
+    collectLinks(linkedNodes, from.id, to.id);
+    collectLinks(linkedNodes, to.id, from.id);
+    collectLinks(linkedEdges, from.id, edge.arrowheadId);
+    collectLinks(linkedEdges, to.id, edge.arrowheadId);
+  });
+
+  linkedNodes.forEach((linkedNodes, selectNode) => {
+    d3.select("#" + selectNode).on("click", () => {
+      planVizContainer().selectAll(".selected").classed("selected", false);
+      planVizContainer().selectAll(".linked").classed("linked", false);
+      d3.select("#" + selectNode + " rect").classed("selected", true);
+      linkedNodes.forEach((linkedNode) => {
+        d3.select("#" + linkedNode + " rect").classed("linked", true);
+      });
+      linkedEdges.get(selectNode).forEach((linkedEdge) => {
+        const arrowHead = d3.select("#" + linkedEdge + " path");
+        arrowHead.classed("linked", true);
+        const arrowShaft = $(arrowHead.node()).parents("g.edgePath").children("path");
+        arrowShaft.addClass("linked");
+      });
+    });
+  });
+}
+
+function collectLinks(map, key, value) {
+  if (!map.has(key)) {
+    map.set(key, new Set());
+  }
+  map.get(key).add(value);
 }

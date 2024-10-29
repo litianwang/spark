@@ -17,39 +17,43 @@
 
 package org.apache.spark.sql.execution.datasources.v2
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.catalog.v2.{Identifier, TableCatalog}
-import org.apache.spark.sql.catalog.v2.expressions.Transform
+import org.apache.spark.internal.LogKeys.TABLE_NAME
+import org.apache.spark.internal.MDC
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.execution.LeafExecNode
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.catalyst.plans.logical.TableSpec
+import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column, Identifier, TableCatalog}
+import org.apache.spark.sql.connector.expressions.Transform
+import org.apache.spark.sql.errors.QueryCompilationErrors
 
 case class CreateTableExec(
     catalog: TableCatalog,
     identifier: Identifier,
-    tableSchema: StructType,
+    columns: Array[Column],
     partitioning: Seq[Transform],
-    tableProperties: Map[String, String],
-    ignoreIfExists: Boolean) extends LeafExecNode {
-  import org.apache.spark.sql.catalog.v2.CatalogV2Implicits._
+    tableSpec: TableSpec,
+    ignoreIfExists: Boolean) extends LeafV2CommandExec {
+  import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 
-  override protected def doExecute(): RDD[InternalRow] = {
+  val tableProperties = CatalogV2Util.convertTableProperties(tableSpec)
+
+  override protected def run(): Seq[InternalRow] = {
     if (!catalog.tableExists(identifier)) {
       try {
-        catalog.createTable(identifier, tableSchema, partitioning.toArray, tableProperties.asJava)
+        catalog.createTable(identifier, columns, partitioning.toArray, tableProperties.asJava)
       } catch {
         case _: TableAlreadyExistsException if ignoreIfExists =>
-          logWarning(s"Table ${identifier.quoted} was created concurrently. Ignoring.")
+          logWarning(
+            log"Table ${MDC(TABLE_NAME, identifier.quoted)} was created concurrently. Ignoring.")
       }
     } else if (!ignoreIfExists) {
-      throw new TableAlreadyExistsException(identifier)
+      throw QueryCompilationErrors.tableAlreadyExistsError(identifier)
     }
 
-    sqlContext.sparkContext.parallelize(Seq.empty, 1)
+    Seq.empty
   }
 
   override def output: Seq[Attribute] = Seq.empty

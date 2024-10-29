@@ -17,15 +17,17 @@
 
 package org.apache.spark.sql.execution
 
-import java.util.ConcurrentModificationException
+import java.io.Closeable
 
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.{SparkEnv, TaskContext}
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.{CLASS_NAME, MAX_NUM_ROWS_IN_MEMORY_BUFFER}
 import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.serializer.SerializerManager
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.ExternalAppendOnlyUnsafeRowArray.DefaultInitialSizeOfInMemoryBuffer
 import org.apache.spark.storage.BlockManager
 import org.apache.spark.util.collection.unsafe.sort.{UnsafeExternalSorter, UnsafeSorterIterator}
@@ -52,7 +54,7 @@ private[sql] class ExternalAppendOnlyUnsafeRowArray(
     numRowsInMemoryBufferThreshold: Int,
     numRowsSpillThreshold: Int) extends Logging {
 
-  def this(numRowsInMemoryBufferThreshold: Int, numRowsSpillThreshold: Int) {
+  def this(numRowsInMemoryBufferThreshold: Int, numRowsSpillThreshold: Int) = {
     this(
       TaskContext.get().taskMemoryManager(),
       SparkEnv.get.blockManager,
@@ -74,6 +76,7 @@ private[sql] class ExternalAppendOnlyUnsafeRowArray(
   }
 
   private var spillableArray: UnsafeExternalSorter = _
+  private var totalSpillBytes: Long = 0
   private var numRows = 0
 
   // A counter to keep track of total modifications done to this array since its creation.
@@ -87,10 +90,22 @@ private[sql] class ExternalAppendOnlyUnsafeRowArray(
   def isEmpty: Boolean = numRows == 0
 
   /**
-   * Clears up resources (eg. memory) held by the backing storage
+   * Total number of bytes that has been spilled into disk so far.
+   */
+  def spillSize: Long = {
+    if (spillableArray != null) {
+      totalSpillBytes + spillableArray.getSpillSize
+    } else {
+      totalSpillBytes
+    }
+  }
+
+  /**
+   * Clears up resources (e.g. memory) held by the backing storage
    */
   def clear(): Unit = {
     if (spillableArray != null) {
+      totalSpillBytes += spillableArray.getSpillSize
       // The last `spillableArray` of this task will be cleaned up via task completion listener
       // inside `UnsafeExternalSorter`
       spillableArray.cleanupResources()
@@ -108,8 +123,9 @@ private[sql] class ExternalAppendOnlyUnsafeRowArray(
       inMemoryBuffer += unsafeRow.copy()
     } else {
       if (spillableArray == null) {
-        logInfo(s"Reached spill threshold of $numRowsInMemoryBufferThreshold rows, switching to " +
-          s"${classOf[UnsafeExternalSorter].getName}")
+        logInfo(log"Reached spill threshold of " +
+          log"${MDC(MAX_NUM_ROWS_IN_MEMORY_BUFFER, numRowsInMemoryBufferThreshold)} rows, " +
+          log"switching to ${MDC(CLASS_NAME, classOf[UnsafeExternalSorter].getName)}")
 
         // We will not sort the rows, so prefixComparator and recordComparator are null
         spillableArray = UnsafeExternalSorter.create(
@@ -160,9 +176,7 @@ private[sql] class ExternalAppendOnlyUnsafeRowArray(
    */
   def generateIterator(startIndex: Int): Iterator[UnsafeRow] = {
     if (startIndex < 0 || (numRows > 0 && startIndex > numRows)) {
-      throw new ArrayIndexOutOfBoundsException(
-        "Invalid `startIndex` provided for generating iterator over the array. " +
-          s"Total elements: $numRows, requested `startIndex`: $startIndex")
+      throw QueryExecutionErrors.invalidStartIndexError(numRows, startIndex)
     }
 
     if (spillableArray == null) {
@@ -182,11 +196,14 @@ private[sql] class ExternalAppendOnlyUnsafeRowArray(
 
     protected def throwExceptionIfModified(): Unit = {
       if (expectedModificationsCount != modificationsCount) {
-        throw new ConcurrentModificationException(
-          s"The backing ${classOf[ExternalAppendOnlyUnsafeRowArray].getName} has been modified " +
-            s"since the creation of this Iterator")
+        closeIfNeeded()
+        throw QueryExecutionErrors.concurrentModificationOnExternalAppendOnlyUnsafeRowArrayError(
+          classOf[ExternalAppendOnlyUnsafeRowArray].getName)
       }
     }
+
+    protected def closeIfNeeded(): Unit = {}
+
   }
 
   private[this] class InMemoryBufferIterator(startIndex: Int)
@@ -194,7 +211,7 @@ private[sql] class ExternalAppendOnlyUnsafeRowArray(
 
     private var currentIndex = startIndex
 
-    override def hasNext(): Boolean = !isModified() && currentIndex < numRows
+    override def hasNext: Boolean = !isModified() && currentIndex < numRows
 
     override def next(): UnsafeRow = {
       throwExceptionIfModified()
@@ -211,13 +228,18 @@ private[sql] class ExternalAppendOnlyUnsafeRowArray(
 
     private val currentRow = new UnsafeRow(numFieldPerRow)
 
-    override def hasNext(): Boolean = !isModified() && iterator.hasNext
+    override def hasNext: Boolean = !isModified() && iterator.hasNext
 
     override def next(): UnsafeRow = {
       throwExceptionIfModified()
       iterator.loadNext()
       currentRow.pointTo(iterator.getBaseObject, iterator.getBaseOffset, iterator.getRecordLength)
       currentRow
+    }
+
+    override protected def closeIfNeeded(): Unit = iterator match {
+      case c: Closeable => c.close()
+      case _ => // do nothing
     }
   }
 }

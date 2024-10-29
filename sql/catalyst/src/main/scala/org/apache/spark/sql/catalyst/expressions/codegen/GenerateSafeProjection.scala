@@ -28,7 +28,7 @@ import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, Generic
 import org.apache.spark.sql.types._
 
 /**
- * Java can not access Projection (in package object)
+ * Java cannot access Projection (in package object)
  */
 abstract class BaseProjection extends Projection {}
 
@@ -155,7 +155,7 @@ object GenerateSafeProjection extends CodeGenerator[Seq[Expression], Projection]
       case (e, i) =>
         val evaluationCode = e.genCode(ctx)
         val converter = convertToSafe(ctx, evaluationCode.value, e.dataType)
-        evaluationCode.code +
+        evaluationCode.code.toString +
           s"""
             if (${evaluationCode.isNull}) {
               mutableRow.setNullAt($i);

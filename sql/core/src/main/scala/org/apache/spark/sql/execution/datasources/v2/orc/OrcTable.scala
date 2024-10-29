@@ -16,13 +16,15 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.orc
 
+import scala.jdk.CollectionConverters._
+
 import org.apache.hadoop.fs.FileStatus
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.connector.write.{LogicalWriteInfo, Write, WriteBuilder}
 import org.apache.spark.sql.execution.datasources.FileFormat
 import org.apache.spark.sql.execution.datasources.orc.OrcUtils
 import org.apache.spark.sql.execution.datasources.v2.FileTable
-import org.apache.spark.sql.sources.v2.writer.WriteBuilder
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -36,13 +38,15 @@ case class OrcTable(
   extends FileTable(sparkSession, options, paths, userSpecifiedSchema) {
 
   override def newScanBuilder(options: CaseInsensitiveStringMap): OrcScanBuilder =
-    new OrcScanBuilder(sparkSession, fileIndex, schema, dataSchema, options)
+    OrcScanBuilder(sparkSession, fileIndex, schema, dataSchema, mergedOptions(options))
 
   override def inferSchema(files: Seq[FileStatus]): Option[StructType] =
-    OrcUtils.readSchema(sparkSession, files)
+    OrcUtils.inferSchema(sparkSession, files, options.asScala.toMap)
 
-  override def newWriteBuilder(options: CaseInsensitiveStringMap): WriteBuilder =
-    new OrcWriteBuilder(options, paths, formatName, supportsDataType)
+  override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder =
+    new WriteBuilder {
+      override def build(): Write = OrcWrite(paths, formatName, supportsDataType, info)
+    }
 
   override def supportsDataType(dataType: DataType): Boolean = dataType match {
     case _: AtomicType => true

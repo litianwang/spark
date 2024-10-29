@@ -17,12 +17,14 @@
 
 package org.apache.spark.sql.execution.streaming
 
-import java.util.Locale
+import java.util.{Locale, UUID}
 
 import scala.collection.mutable
 
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.sql.RuntimeConfig
+import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, LogicalPlan}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.internal.SQLConf
 
@@ -63,7 +65,7 @@ case object MinWatermark extends MultipleWatermarkPolicy {
 }
 
 /**
- * Policy to choose the *min* of the operator watermark values as the global watermark value. So the
+ * Policy to choose the *max* of the operator watermark values as the global watermark value. So the
  * global watermark will advance if any of the individual operator watermarks has advanced.
  * In other words, in a streaming query with multiple input streams and watermarks defined on all
  * of them, the global watermark will advance as fast as the fastest input. So if there is watermark
@@ -78,8 +80,21 @@ case object MaxWatermark extends MultipleWatermarkPolicy {
 }
 
 /** Tracks the watermark value of a streaming query based on a given `policy` */
-case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
-  private val operatorToWatermarkMap = mutable.HashMap[Int, Long]()
+class WatermarkTracker(
+    policy: MultipleWatermarkPolicy,
+    initialPlan: LogicalPlan) extends Logging {
+
+  private val operatorToWatermarkMap: mutable.Map[UUID, Option[Long]] = {
+    val map = mutable.HashMap[UUID, Option[Long]]()
+    val watermarkOperators = initialPlan.collect {
+      case e: EventTimeWatermark => e
+    }
+    watermarkOperators.foreach { op =>
+      map.put(op.nodeId, None)
+    }
+    map
+  }
+
   private var globalWatermarkMs: Long = 0
 
   def setWatermark(newWatermarkMs: Long): Unit = synchronized {
@@ -92,29 +107,37 @@ case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
     }
     if (watermarkOperators.isEmpty) return
 
-    watermarkOperators.zipWithIndex.foreach {
-      case (e, index) if e.eventTimeStats.value.count > 0 =>
-        logDebug(s"Observed event time stats $index: ${e.eventTimeStats.value}")
-        val newWatermarkMs = e.eventTimeStats.value.max - e.delayMs
-        val prevWatermarkMs = operatorToWatermarkMap.get(index)
-        if (prevWatermarkMs.isEmpty || newWatermarkMs > prevWatermarkMs.get) {
-          operatorToWatermarkMap.put(index, newWatermarkMs)
+    watermarkOperators.foreach {
+      case e if e.eventTimeStats.value.count > 0 =>
+        logDebug(s"Observed event time stats ${e.nodeId}: ${e.eventTimeStats.value}")
+
+        if (!operatorToWatermarkMap.isDefinedAt(e.nodeId)) {
+          throw new IllegalStateException(s"Unknown watermark node ID: ${e.nodeId}, known IDs: " +
+            s"${operatorToWatermarkMap.keys.mkString("[", ",", "]")}")
         }
 
-      // Populate 0 if we haven't seen any data yet for this watermark node.
-      case (_, index) =>
-        if (!operatorToWatermarkMap.isDefinedAt(index)) {
-          operatorToWatermarkMap.put(index, 0)
+        val newWatermarkMs = e.eventTimeStats.value.max - e.delayMs
+        val prevWatermarkMs = operatorToWatermarkMap(e.nodeId)
+        if (prevWatermarkMs.isEmpty || newWatermarkMs > prevWatermarkMs.get) {
+          operatorToWatermarkMap.put(e.nodeId, Some(newWatermarkMs))
+        }
+
+      case e =>
+        if (!operatorToWatermarkMap.isDefinedAt(e.nodeId)) {
+          throw new IllegalStateException(s"Unknown watermark node ID: ${e.nodeId}, known IDs: " +
+            s"${operatorToWatermarkMap.keys.mkString("[", ",", "]")}")
         }
     }
 
-    // Update the global watermark to the minimum of all watermark nodes.
-    // This is the safest option, because only the global watermark is fault-tolerant. Making
-    // it the minimum of all individual watermarks guarantees it will never advance past where
-    // any individual watermark operator would be if it were in a plan by itself.
-    val chosenGlobalWatermark = policy.chooseGlobalWatermark(operatorToWatermarkMap.values.toSeq)
+    // Update the global watermark accordingly to the chosen policy. To find all available policies
+    // and their semantics, please check the comments of
+    // `org.apache.spark.sql.execution.streaming.MultipleWatermarkPolicy` implementations.
+    val chosenGlobalWatermark = policy.chooseGlobalWatermark(
+      operatorToWatermarkMap.values.map(_.getOrElse(0L)).toSeq)
     if (chosenGlobalWatermark > globalWatermarkMs) {
-      logInfo(s"Updating event-time watermark from $globalWatermarkMs to $chosenGlobalWatermark ms")
+      logInfo(log"Updating event-time watermark from " +
+        log"${MDC(GLOBAL_WATERMARK, globalWatermarkMs)} " +
+        log"to ${MDC(CHOSEN_WATERMARK, chosenGlobalWatermark)} ms")
       globalWatermarkMs = chosenGlobalWatermark
     } else {
       logDebug(s"Event time watermark didn't move: $chosenGlobalWatermark < $globalWatermarkMs")
@@ -122,10 +145,14 @@ case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
   }
 
   def currentWatermark: Long = synchronized { globalWatermarkMs }
+
+  private[sql] def watermarkMap: Map[UUID, Option[Long]] = synchronized {
+    operatorToWatermarkMap.toMap
+  }
 }
 
 object WatermarkTracker {
-  def apply(conf: RuntimeConfig): WatermarkTracker = {
+  def apply(conf: RuntimeConfig, initialPlan: LogicalPlan): WatermarkTracker = {
     // If the session has been explicitly configured to use non-default policy then use it,
     // otherwise use the default `min` policy as thats the safe thing to do.
     // When recovering from a checkpoint location, it is expected that the `conf` will already
@@ -133,7 +160,8 @@ object WatermarkTracker {
     // saved in the checkpoint (e.g., old checkpoints), then the default `min` policy is enforced
     // through defaults specified in OffsetSeqMetadata.setSessionConf().
     val policyName = conf.get(
-      SQLConf.STREAMING_MULTIPLE_WATERMARK_POLICY, MultipleWatermarkPolicy.DEFAULT_POLICY_NAME)
-    new WatermarkTracker(MultipleWatermarkPolicy(policyName))
+      SQLConf.STREAMING_MULTIPLE_WATERMARK_POLICY.key,
+      MultipleWatermarkPolicy.DEFAULT_POLICY_NAME)
+    new WatermarkTracker(MultipleWatermarkPolicy(policyName), initialPlan)
   }
 }

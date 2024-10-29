@@ -21,7 +21,8 @@ import org.apache.spark.ml.attribute.{Attribute, NominalAttribute}
 import org.apache.spark.ml.param.ParamsSuite
 import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTest, MLTestingUtils}
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.catalyst.parser.DataTypeParser
+import org.apache.spark.sql.functions.{col, struct}
 import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
 
 class StringIndexerSuite extends MLTest with DefaultReadWriteTest {
@@ -92,8 +93,69 @@ class StringIndexerSuite extends MLTest with DefaultReadWriteTest {
       val attr = Attribute.fromStructField(rows.head.schema("labelIndex"))
         .asInstanceOf[NominalAttribute]
       assert(attr.values.get === Array("a", "c", "b"))
-      assert(rows.seq === expected.collect().toSeq)
+      assert(rows === expected.collect().toSeq)
     }
+  }
+
+  test("StringIndexer.transformSchema)") {
+    val idxToStr = new StringIndexer().setInputCol("input").setOutputCol("output")
+    val inSchema = StructType(Seq(StructField("input", StringType)))
+    val outSchema = idxToStr.transformSchema(inSchema)
+    assert(outSchema("output").dataType === DoubleType)
+  }
+
+  test("StringIndexer.transformSchema multi col") {
+    val idxToStr = new StringIndexer().setInputCols(Array("input", "input2")).
+      setOutputCols(Array("output", "output2"))
+    val inSchema = StructType(Seq(StructField("input", StringType),
+      StructField("input2", StringType)))
+    val outSchema = idxToStr.transformSchema(inSchema)
+    assert(outSchema("output").dataType === DoubleType)
+    assert(outSchema("output2").dataType === DoubleType)
+  }
+
+  test("StringIndexer.transformSchema nested col") {
+    val outputCols = Array("output", "output2", "output3", "output4", "output5")
+    val idxToStr = new StringIndexer().setInputCols(
+      Array("input1.a.f1", "input1.a.f2", "input2.b1", "input2.b2", "input3")
+    ).setOutputCols(outputCols)
+
+    val inSchema = DataTypeParser.parseTableSchema(
+      "input1 struct<a struct<f1 string, f2 string>>, " +
+      "input2 struct<b1 string, b2 string>, input3 string"
+    )
+    val outSchema = idxToStr.transformSchema(inSchema)
+
+    for (outputCol <- outputCols) {
+      assert(outSchema(outputCol).dataType === DoubleType)
+    }
+  }
+
+  test("StringIndexer nested input cols") {
+    val data = Seq((0, "a"), (1, "b"), (2, "c"), (3, "a"), (4, "a"), (5, "c"))
+    val df = data.toDF("id", "label")
+      .select(col("id"), struct(col("label")).alias("c1"))
+    val indexer = new StringIndexer()
+      .setInputCol("c1.label")
+      .setOutputCol("labelIndex")
+    val indexerModel = indexer.fit(df)
+    MLTestingUtils.checkCopyAndUids(indexer, indexerModel)
+    // a -> 0, b -> 2, c -> 1
+    val expected = Seq(
+      (0, 0.0),
+      (1, 2.0),
+      (2, 1.0),
+      (3, 0.0),
+      (4, 0.0),
+      (5, 1.0)
+    ).toDF("id", "labelIndex")
+
+    val dfOutput = indexerModel.transform(df)
+    val outputs = dfOutput.select("id", "labelIndex").collect().toSeq
+    val attr = Attribute.fromStructField(outputs.head.schema("labelIndex"))
+      .asInstanceOf[NominalAttribute]
+    assert(attr.values.get === Array("a", "c", "b"))
+    assert(outputs === expected.collect().toSeq)
   }
 
   test("StringIndexerUnseen") {
@@ -122,7 +184,7 @@ class StringIndexerSuite extends MLTest with DefaultReadWriteTest {
       val attrSkip = Attribute.fromStructField(rows.head.schema("labelIndex"))
         .asInstanceOf[NominalAttribute]
       assert(attrSkip.values.get === Array("b", "a"))
-      assert(rows.seq === expectedSkip.collect().toSeq)
+      assert(rows === expectedSkip.collect().toSeq)
     }
 
     indexer.setHandleInvalid("keep")
@@ -246,7 +308,7 @@ class StringIndexerSuite extends MLTest with DefaultReadWriteTest {
       .setOutputCol("myOutputCol")
       .setHandleInvalid("skip")
     val newInstance = testDefaultReadWrite(instance)
-    assert(newInstance.labels === instance.labels)
+    assert(newInstance.labelsArray(0) === instance.labelsArray(0))
   }
 
   test("IndexToString params") {
@@ -292,7 +354,7 @@ class StringIndexerSuite extends MLTest with DefaultReadWriteTest {
     val idx2str = new IndexToString()
       .setInputCol("labelIndex")
       .setOutputCol("sameLabel")
-      .setLabels(indexer.labels)
+      .setLabels(indexer.labelsArray(0))
 
     testTransformer[(Int, String, Double)](transformed, idx2str, "sameLabel", "label") {
       case Row(sameLabel, label) =>
@@ -459,13 +521,13 @@ class StringIndexerSuite extends MLTest with DefaultReadWriteTest {
   }
 
   test("Load StringIndexderModel prior to Spark 3.0") {
-    val modelPath = testFile("test-data/strIndexerModel")
+    val modelPath = testFile("ml-models/strIndexerModel-2.4.4")
 
     val loadedModel = StringIndexerModel.load(modelPath)
     assert(loadedModel.labelsArray === Array(Array("b", "c", "a")))
 
     val metadata = spark.read.json(s"$modelPath/metadata")
     val sparkVersionStr = metadata.select("sparkVersion").first().getString(0)
-    assert(sparkVersionStr == "2.4.1-SNAPSHOT")
+    assert(sparkVersionStr === "2.4.4")
   }
 }

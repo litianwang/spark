@@ -21,6 +21,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeProjection}
 import org.apache.spark.sql.execution.metric.SQLMetrics
+import org.apache.spark.util.ArrayImplicits._
 
 
 /**
@@ -45,10 +46,15 @@ case class LocalTableScanExec(
     }
   }
 
-  private lazy val numParallelism: Int = math.min(math.max(unsafeRows.length, 1),
-    sqlContext.sparkContext.defaultParallelism)
-
-  private lazy val rdd = sqlContext.sparkContext.parallelize(unsafeRows, numParallelism)
+  @transient private lazy val rdd: RDD[InternalRow] = {
+    if (rows.isEmpty) {
+      sparkContext.emptyRDD
+    } else {
+      val numSlices = math.min(
+        unsafeRows.length, session.leafNodeDefaultParallelism)
+      sparkContext.parallelize(unsafeRows.toImmutableArraySeq, numSlices)
+    }
+  }
 
   protected override def doExecute(): RDD[InternalRow] = {
     val numOutputRows = longMetric("numOutputRows")
@@ -67,21 +73,32 @@ case class LocalTableScanExec(
   }
 
   override def executeCollect(): Array[InternalRow] = {
-    longMetric("numOutputRows").add(unsafeRows.size)
+    longMetric("numOutputRows").add(unsafeRows.length)
+    sendDriverMetrics()
     unsafeRows
   }
 
   override def executeTake(limit: Int): Array[InternalRow] = {
     val taken = unsafeRows.take(limit)
-    longMetric("numOutputRows").add(taken.size)
+    longMetric("numOutputRows").add(taken.length)
+    sendDriverMetrics()
     taken
+  }
+
+  override def executeTail(limit: Int): Array[InternalRow] = {
+    val taken: Seq[InternalRow] = unsafeRows.takeRight(limit).toImmutableArraySeq
+    longMetric("numOutputRows").add(taken.size)
+    sendDriverMetrics()
+    taken.toArray
   }
 
   // Input is already UnsafeRows.
   override protected val createUnsafeProjection: Boolean = false
 
-  // Do not codegen when there is no parent - to support the fast driver-local collect/take paths.
-  override def supportCodegen: Boolean = (parent != null)
-
   override def inputRDD: RDD[InternalRow] = rdd
+
+  private def sendDriverMetrics(): Unit = {
+    val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
+    SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, metrics.values.toSeq)
+  }
 }

@@ -17,7 +17,7 @@
 
 package org.apache.spark.deploy
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.curator.framework.{CuratorFramework, CuratorFrameworkFactory}
 import org.apache.curator.retry.ExponentialBackoffRetry
@@ -45,7 +45,7 @@ private[spark] object SparkCuratorUtil extends Logging {
     zk
   }
 
-  def mkdir(zk: CuratorFramework, path: String) {
+  def mkdir(zk: CuratorFramework, path: String): Unit = {
     if (zk.checkExists().forPath(path) == null) {
       try {
         zk.create().creatingParentsIfNeeded().forPath(path)
@@ -57,7 +57,7 @@ private[spark] object SparkCuratorUtil extends Logging {
     }
   }
 
-  def deleteRecursive(zk: CuratorFramework, path: String) {
+  def deleteRecursive(zk: CuratorFramework, path: String): Unit = {
     if (zk.checkExists().forPath(path) != null) {
       for (child <- zk.getChildren.forPath(path).asScala) {
         zk.delete().forPath(path + "/" + child)

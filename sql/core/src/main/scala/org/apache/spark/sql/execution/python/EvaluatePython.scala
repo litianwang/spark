@@ -20,10 +20,11 @@ package org.apache.spark.sql.execution.python
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import net.razorvine.pickle.{IObjectPickler, Opcodes, Pickler}
 
+import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.api.python.SerDeUtil
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -35,7 +36,7 @@ import org.apache.spark.unsafe.types.UTF8String
 object EvaluatePython {
 
   def needConversionInPython(dt: DataType): Boolean = dt match {
-    case DateType | TimestampType => true
+    case DateType | TimestampType | TimestampNTZType | _: DayTimeIntervalType => true
     case _: StructType => true
     case _: UserDefinedType[_] => true
     case ArrayType(elementType, _) => needConversionInPython(elementType)
@@ -45,7 +46,7 @@ object EvaluatePython {
   }
 
   /**
-   * Helper for converting from Catalyst type to java type suitable for Pyrolite.
+   * Helper for converting from Catalyst type to java type suitable for Pickle.
    */
   def toJava(obj: Any, dataType: DataType): Any = (obj, dataType) match {
     case (null, _) => null
@@ -137,13 +138,14 @@ object EvaluatePython {
       case c: Int => c
     }
 
-    case TimestampType => (obj: Any) => nullSafeConvert(obj) {
-      case c: Long => c
-      // Py4J serializes values between MIN_INT and MAX_INT as Ints, not Longs
-      case c: Int => c.toLong
-    }
+    case TimestampType | TimestampNTZType | _: DayTimeIntervalType => (obj: Any) =>
+      nullSafeConvert(obj) {
+        case c: Long => c
+        // Py4J serializes values between MIN_INT and MAX_INT as Ints, not Longs
+        case c: Int => c.toLong
+      }
 
-    case StringType => (obj: Any) => nullSafeConvert(obj) {
+    case _: StringType => (obj: Any) => nullSafeConvert(obj) {
       case _ => UTF8String.fromString(obj.toString)
     }
 
@@ -175,16 +177,17 @@ object EvaluatePython {
       }
 
     case StructType(fields) =>
-      val fieldsFromJava = fields.map(f => makeFromJava(f.dataType)).toArray
+      val fieldsFromJava = fields.map(f => makeFromJava(f.dataType))
 
       (obj: Any) => nullSafeConvert(obj) {
         case c if c.getClass.isArray =>
           val array = c.asInstanceOf[Array[_]]
           if (array.length != fields.length) {
-            throw new IllegalStateException(
-              s"Input row doesn't have expected number of values required by the schema. " +
-                s"${fields.length} fields are required while ${array.length} values are provided."
-            )
+            throw new SparkIllegalArgumentException(
+              errorClass = "STRUCT_ARRAY_LENGTH_MISMATCH",
+              messageParameters = Map(
+                "expected" -> fields.length.toString,
+                "actual" -> array.length.toString))
           }
 
           val row = new GenericInternalRow(fields.length)
@@ -198,7 +201,7 @@ object EvaluatePython {
 
     case udt: UserDefinedType[_] => makeFromJava(udt.sqlType)
 
-    case other => (obj: Any) => nullSafeConvert(other)(PartialFunction.empty)
+    case other => (obj: Any) => nullSafeConvert(obj)(PartialFunction.empty)
   }
 
   private def nullSafeConvert(input: Any)(f: PartialFunction[Any, Any]): Any = {

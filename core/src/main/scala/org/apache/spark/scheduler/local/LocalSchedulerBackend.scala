@@ -26,9 +26,13 @@ import org.apache.spark.TaskState.TaskState
 import org.apache.spark.executor.{Executor, ExecutorBackend}
 import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.launcher.{LauncherBackend, SparkAppHandle}
+import org.apache.spark.resource.{ResourceInformation, ResourceProfile}
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpointRef, RpcEnv, ThreadSafeRpcEndpoint}
 import org.apache.spark.scheduler._
+import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.TaskThreadDump
 import org.apache.spark.scheduler.cluster.ExecutorInfo
+import org.apache.spark.status.api.v1.ThreadStackTrace
+import org.apache.spark.util.Utils
 
 private case class ReviveOffers()
 
@@ -54,10 +58,12 @@ private[spark] class LocalEndpoint(
   private var freeCores = totalCores
 
   val localExecutorId = SparkContext.DRIVER_IDENTIFIER
-  val localExecutorHostname = "localhost"
+  val localExecutorHostname = Utils.localCanonicalHostName()
 
+  // local mode doesn't support extra resources like GPUs right now
   private val executor = new Executor(
-    localExecutorId, localExecutorHostname, SparkEnv.get, userClassPath, isLocal = true)
+    localExecutorId, localExecutorHostname, SparkEnv.get, userClassPath, isLocal = true,
+    resources = Map.empty[String, ResourceInformation])
 
   override def receive: PartialFunction[Any, Unit] = {
     case ReviveOffers =>
@@ -78,13 +84,15 @@ private[spark] class LocalEndpoint(
     case StopExecutor =>
       executor.stop()
       context.reply(true)
+    case TaskThreadDump(taskId) =>
+      context.reply(executor.getTaskThreadDump(taskId))
   }
 
-  def reviveOffers() {
+  def reviveOffers(): Unit = {
     // local mode doesn't support extra resources like GPUs right now
     val offers = IndexedSeq(new WorkerOffer(localExecutorId, localExecutorHostname, freeCores,
       Some(rpcEnv.address.hostPort)))
-    for (task <- scheduler.resourceOffers(offers).flatten) {
+    for (task <- scheduler.resourceOffers(offers, true).flatten) {
       freeCores -= scheduler.CPUS_PER_TASK
       executor.launchTask(executorBackend, task)
     }
@@ -102,7 +110,7 @@ private[spark] class LocalSchedulerBackend(
     val totalCores: Int)
   extends SchedulerBackend with ExecutorBackend with Logging {
 
-  private val appId = "local-" + System.currentTimeMillis
+  private val appId = conf.get("spark.test.appId", "local-" + System.currentTimeMillis)
   private var localEndpoint: RpcEndpointRef = null
   private val userClassPath = getUserClasspath(conf)
   private val listenerBus = scheduler.sc.listenerBus
@@ -123,7 +131,7 @@ private[spark] class LocalSchedulerBackend(
 
   launcherBackend.connect()
 
-  override def start() {
+  override def start(): Unit = {
     val rpcEnv = SparkEnv.get.rpcEnv
     val executorEndpoint = new LocalEndpoint(rpcEnv, userClassPath, scheduler, this, totalCores)
     localEndpoint = rpcEnv.setupEndpoint("LocalSchedulerBackendEndpoint", executorEndpoint)
@@ -134,31 +142,37 @@ private[spark] class LocalSchedulerBackend(
         Map.empty)))
     launcherBackend.setAppId(appId)
     launcherBackend.setState(SparkAppHandle.State.RUNNING)
+    reviveOffers()
   }
 
-  override def stop() {
+  override def stop(): Unit = {
     stop(SparkAppHandle.State.FINISHED)
   }
 
-  override def reviveOffers() {
+  override def reviveOffers(): Unit = {
     localEndpoint.send(ReviveOffers)
   }
 
   override def defaultParallelism(): Int =
-    scheduler.conf.getInt("spark.default.parallelism", totalCores)
+    scheduler.conf.getInt(config.DEFAULT_PARALLELISM.key, totalCores)
 
   override def killTask(
-      taskId: Long, executorId: String, interruptThread: Boolean, reason: String) {
+      taskId: Long, executorId: String, interruptThread: Boolean, reason: String): Unit = {
     localEndpoint.send(KillTask(taskId, interruptThread, reason))
   }
 
-  override def statusUpdate(taskId: Long, state: TaskState, serializedData: ByteBuffer) {
+  override def statusUpdate(taskId: Long, state: TaskState, serializedData: ByteBuffer): Unit = {
     localEndpoint.send(StatusUpdate(taskId, state, serializedData))
   }
 
   override def applicationId(): String = appId
 
-  override def maxNumConcurrentTasks(): Int = totalCores / scheduler.CPUS_PER_TASK
+  // Doesn't support different ResourceProfiles yet
+  // so we expect all executors to be of same ResourceProfile
+  override def maxNumConcurrentTasks(rp: ResourceProfile): Int = {
+    val cpusPerTask = ResourceProfile.getTaskCpusOrDefaultForProfile(rp, conf)
+    totalCores / cpusPerTask
+  }
 
   private def stop(finalState: SparkAppHandle.State): Unit = {
     localEndpoint.ask(StopExecutor)
@@ -169,4 +183,7 @@ private[spark] class LocalSchedulerBackend(
     }
   }
 
+  override def getTaskThreadDump(taskId: Long, executorId: String): Option[ThreadStackTrace] = {
+    localEndpoint.askSync[Option[ThreadStackTrace]](TaskThreadDump(taskId))
+  }
 }

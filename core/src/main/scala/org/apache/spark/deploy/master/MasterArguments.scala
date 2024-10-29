@@ -53,6 +53,9 @@ private[master] class MasterArguments(args: Array[String], conf: SparkConf) exte
 
   // This mutates the SparkConf, so all accesses to it must be made after this line
   propertiesFile = Utils.loadDefaultSparkProperties(conf, propertiesFile)
+  // Initialize logging system again after `spark.log.structuredLogging.enabled` takes effect
+  Utils.resetStructuredLogging(conf)
+  Logging.uninitialize()
 
   if (conf.contains(MASTER_UI_PORT.key)) {
     webUiPort = conf.get(MASTER_UI_PORT)
@@ -94,7 +97,7 @@ private[master] class MasterArguments(args: Array[String], conf: SparkConf) exte
   /**
    * Print usage and exit JVM with the given exit code.
    */
-  private def printUsageAndExit(exitCode: Int) {
+  private def printUsageAndExit(exitCode: Int): Unit = {
     // scalastyle:off println
     System.err.println(
       "Usage: Master [options]\n" +

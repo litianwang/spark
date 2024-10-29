@@ -21,7 +21,8 @@ import scala.reflect.ClassTag
 
 import org.apache.spark.sql.TPCDSQuerySuite
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Complete, Final}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Generate, Join, LocalRelation, LogicalPlan, Range, Sample, Union, Window}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Generate, Join, LocalRelation, LogicalPlan, Range, Sample, Union, Window, WithCTE}
+import org.apache.spark.sql.execution.adaptive.DisableAdaptiveExecutionSuite
 import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, ObjectHashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.execution.columnar.{InMemoryRelation, InMemoryTableScanExec}
 import org.apache.spark.sql.execution.datasources.LogicalRelation
@@ -30,10 +31,12 @@ import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExc
 import org.apache.spark.sql.execution.joins._
 import org.apache.spark.sql.execution.window.WindowExec
 
-class LogicalPlanTagInSparkPlanSuite extends TPCDSQuerySuite {
+// Disable AQE because AdaptiveSparkPlanExec does not have a logical plan link
+class LogicalPlanTagInSparkPlanSuite extends TPCDSQuerySuite with DisableAdaptiveExecutionSuite {
 
-  override protected def checkGeneratedCode(plan: SparkPlan): Unit = {
-    super.checkGeneratedCode(plan)
+  override protected def checkGeneratedCode(
+      plan: SparkPlan, checkMethodCodeSize: Boolean = true): Unit = {
+    super.checkGeneratedCode(plan, checkMethodCodeSize)
     checkLogicalPlanTag(plan)
   }
 
@@ -44,7 +47,10 @@ class LogicalPlanTagInSparkPlanSuite extends TPCDSQuerySuite {
   }
 
   // A scan plan tree is a plan tree that has a leaf node under zero or more Project/Filter nodes.
+  // We may add `ColumnarToRowExec` and `InputAdapter` above the scan node after planning.
+  @scala.annotation.tailrec
   private def isScanPlanTree(plan: SparkPlan): Boolean = plan match {
+    case ColumnarToRowExec(i: InputAdapter) => isScanPlanTree(i.child)
     case p: ProjectExec => isScanPlanTree(p.child)
     case f: FilterExec => isScanPlanTree(f.child)
     case _: LeafExecNode => true
@@ -88,6 +94,13 @@ class LogicalPlanTagInSparkPlanSuite extends TPCDSQuerySuite {
         assert(plan.getTagValue(SparkPlan.LOGICAL_PLAN_TAG).isEmpty)
 
       case _ if isScanPlanTree(plan) =>
+        // `ColumnarToRowExec` and `InputAdapter` are added outside of the planner, which doesn't
+        // have the logical plan tag.
+        val actualPlan = plan match {
+          case ColumnarToRowExec(i: InputAdapter) => i.child
+          case _ => plan
+        }
+
         // The strategies for planning scan can remove or add FilterExec/ProjectExec nodes,
         // so it's not simple to check. Instead, we only check that the origin LogicalPlan
         // contains the corresponding leaf node of the SparkPlan.
@@ -95,7 +108,11 @@ class LogicalPlanTagInSparkPlanSuite extends TPCDSQuerySuite {
         //   logical = Project(Filter(Scan A))
         //   physical = ProjectExec(ScanExec A)
         // we only check that leaf modes match between logical and physical plan.
-        val logicalLeaves = getLogicalPlan(plan).collectLeaves()
+        val logicalPlan = getLogicalPlan(actualPlan) match {
+          case w: WithCTE => w.plan
+          case o => o
+        }
+        val logicalLeaves = logicalPlan.collectLeaves()
         val physicalLeaves = plan.collectLeaves()
         assert(logicalLeaves.length == 1)
         assert(physicalLeaves.length == 1)

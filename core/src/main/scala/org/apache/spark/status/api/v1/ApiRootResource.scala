@@ -17,11 +17,11 @@
 package org.apache.spark.status.api.v1
 
 import java.util.zip.ZipOutputStream
-import javax.servlet.ServletContext
-import javax.servlet.http.HttpServletRequest
-import javax.ws.rs._
-import javax.ws.rs.core.{Context, Response}
 
+import jakarta.servlet.ServletContext
+import jakarta.servlet.http.HttpServletRequest
+import jakarta.ws.rs._
+import jakarta.ws.rs.core.{Context, Response}
 import org.eclipse.jetty.server.handler.ContextHandler
 import org.eclipse.jetty.servlet.{ServletContextHandler, ServletHolder}
 import org.glassfish.jersey.server.ServerProperties
@@ -95,6 +95,8 @@ private[spark] trait UIRoot {
       .build()
   }
   def securityManager: SecurityManager
+
+  def checkUIViewPermissions(appId: String, attemptId: Option[String], user: String): Boolean
 }
 
 private[v1] object UIRootFromServletContext {
@@ -138,6 +140,19 @@ private[v1] trait BaseAppResource extends ApiRequestContext {
           throw new ForbiddenException(raw"""user "$user" is not authorized""")
         }
         fn(ui)
+      }
+    } catch {
+      case _: NoSuchElementException =>
+        val appKey = Option(attemptId).map(appId + "/" + _).getOrElse(appId)
+        throw new NotFoundException(s"no such app: $appKey")
+    }
+  }
+
+  protected def checkUIViewPermissions(): Unit = {
+    try {
+      val user = httpRequest.getRemoteUser()
+      if (!uiRoot.checkUIViewPermissions(appId, Option(attemptId), user)) {
+        throw new ForbiddenException(raw"""user "$user" is not authorized""")
       }
     } catch {
       case _: NoSuchElementException =>

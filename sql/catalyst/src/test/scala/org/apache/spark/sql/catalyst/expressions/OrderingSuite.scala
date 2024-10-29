@@ -26,6 +26,7 @@ import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, GenerateOrdering, LazilyGeneratedOrdering}
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 class OrderingSuite extends SparkFunSuite with ExpressionEvalHelper {
 
@@ -106,7 +107,7 @@ class OrderingSuite extends SparkFunSuite with ExpressionEvalHelper {
           StructField("a", dataType, nullable = true) ::
             StructField("b", dataType, nullable = true) :: Nil)
         val maybeDataGenerator = RandomDataGenerator.forType(rowType, nullable = false)
-        assume(maybeDataGenerator.isDefined)
+        assert(maybeDataGenerator.isDefined)
         val randGenerator = maybeDataGenerator.get
         val toCatalyst = CatalystTypeConverters.createToCatalystConverter(rowType)
         for (_ <- 1 to 50) {
@@ -132,10 +133,10 @@ class OrderingSuite extends SparkFunSuite with ExpressionEvalHelper {
     val sortOrder = Literal("abc").asc
 
     // this is passing prior to SPARK-16845, and it should also be passing after SPARK-16845
-    GenerateOrdering.generate(Array.fill(40)(sortOrder))
+    GenerateOrdering.generate(Array.fill(40)(sortOrder).toImmutableArraySeq)
 
     // verify that we can support up to 5000 ordering comparisons, which should be sufficient
-    GenerateOrdering.generate(Array.fill(5000)(sortOrder))
+    GenerateOrdering.generate(Array.fill(5000)(sortOrder).toImmutableArraySeq)
   }
 
   test("SPARK-21344: BinaryType comparison does signed byte array comparison") {

@@ -18,12 +18,12 @@
 package org.apache.spark.ui
 
 import java.util.{Enumeration, Map => JMap}
-import javax.servlet._
-import javax.servlet.http.{HttpServletRequest, HttpServletRequestWrapper, HttpServletResponse}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
-import org.apache.commons.lang3.StringEscapeUtils
+import jakarta.servlet._
+import jakarta.servlet.http.{HttpServletRequest, HttpServletRequestWrapper, HttpServletResponse}
+import org.apache.commons.text.StringEscapeUtils
 
 import org.apache.spark.{SecurityManager, SparkConf}
 import org.apache.spark.internal.config.UI._

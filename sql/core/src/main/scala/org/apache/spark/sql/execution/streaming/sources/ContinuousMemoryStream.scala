@@ -22,16 +22,17 @@ import javax.annotation.concurrent.GuardedBy
 
 import scala.collection.mutable.ListBuffer
 
-import org.json4s.NoTypeHints
+import org.json4s.{Formats, NoTypeHints}
 import org.json4s.jackson.Serialization
 
 import org.apache.spark.{SparkEnv, TaskContext}
 import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.sql.{Encoder, SQLContext}
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.UnsafeRow
+import org.apache.spark.sql.connector.read.InputPartition
+import org.apache.spark.sql.connector.read.streaming.{ContinuousPartitionReader, ContinuousPartitionReaderFactory, ContinuousStream, Offset, PartitionOffset}
 import org.apache.spark.sql.execution.streaming.{Offset => _, _}
-import org.apache.spark.sql.sources.v2.reader.InputPartition
-import org.apache.spark.sql.sources.v2.reader.streaming._
 import org.apache.spark.util.RpcUtils
 
 /**
@@ -45,20 +46,21 @@ import org.apache.spark.util.RpcUtils
 class ContinuousMemoryStream[A : Encoder](id: Int, sqlContext: SQLContext, numPartitions: Int = 2)
   extends MemoryStreamBase[A](sqlContext) with ContinuousStream {
 
-  private implicit val formats = Serialization.formats(NoTypeHints)
+  private implicit val formats: Formats = Serialization.formats(NoTypeHints)
 
   // ContinuousReader implementation
 
   @GuardedBy("this")
-  private val records = Seq.fill(numPartitions)(new ListBuffer[A])
+  private val records = Seq.fill(numPartitions)(new ListBuffer[UnsafeRow])
 
   private val recordEndpoint = new ContinuousRecordEndpoint(records, this)
   @volatile private var endpointRef: RpcEndpointRef = _
 
-  def addData(data: TraversableOnce[A]): Offset = synchronized {
+  def addData(data: IterableOnce[A]): Offset = synchronized {
     // Distribute data evenly among partition lists.
-    data.toSeq.zipWithIndex.map {
-      case (item, index) => records(index % numPartitions) += item
+    data.iterator.to(Seq).zipWithIndex.map {
+      case (item, index) =>
+        records(index % numPartitions) += toRow(item).copy().asInstanceOf[UnsafeRow]
     }
 
     // The new target offset is the offset where all records in all partitions have been processed.
@@ -180,6 +182,6 @@ class ContinuousMemoryStreamPartitionReader(
 
 case class ContinuousMemoryStreamOffset(partitionNums: Map[Int, Int])
   extends Offset {
-  private implicit val formats = Serialization.formats(NoTypeHints)
+  private implicit val formats: Formats = Serialization.formats(NoTypeHints)
   override def json(): String = Serialization.write(partitionNums)
 }

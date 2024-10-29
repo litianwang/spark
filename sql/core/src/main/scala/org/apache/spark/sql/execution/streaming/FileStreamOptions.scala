@@ -17,10 +17,13 @@
 
 package org.apache.spark.sql.execution.streaming
 
+import java.util.Locale
+
 import scala.util.Try
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
+import org.apache.spark.sql.execution.datasources.FileIndexOptions
 import org.apache.spark.util.Utils
 
 /**
@@ -30,6 +33,16 @@ class FileStreamOptions(parameters: CaseInsensitiveMap[String]) extends Logging 
 
   def this(parameters: Map[String, String]) = this(CaseInsensitiveMap(parameters))
 
+  checkDisallowedOptions()
+
+  private def checkDisallowedOptions(): Unit = {
+    Seq(FileIndexOptions.MODIFIED_BEFORE, FileIndexOptions.MODIFIED_AFTER).foreach { param =>
+      if (parameters.contains(param)) {
+        throw new IllegalArgumentException(s"option '$param' is not allowed in file stream sources")
+      }
+    }
+  }
+
   val maxFilesPerTrigger: Option[Int] = parameters.get("maxFilesPerTrigger").map { str =>
     Try(str.toInt).toOption.filter(_ > 0).getOrElse {
       throw new IllegalArgumentException(
@@ -37,11 +50,25 @@ class FileStreamOptions(parameters: CaseInsensitiveMap[String]) extends Logging 
     }
   }
 
+  val maxBytesPerTrigger: Option[Long] = parameters.get("maxBytesPerTrigger").map { str =>
+    Try(str.toLong).toOption.filter(_ > 0).map(op =>
+      if (maxFilesPerTrigger.nonEmpty) {
+        throw new IllegalArgumentException(
+          "Options 'maxFilesPerTrigger' and 'maxBytesPerTrigger' " +
+            "can't be both set at the same time")
+      } else op
+    ).getOrElse {
+      throw new IllegalArgumentException(
+        s"Invalid value '$str' for option 'maxBytesPerTrigger', must be a positive integer")
+    }
+  }
+
   /**
    * Maximum age of a file that can be found in this directory, before it is ignored. For the
    * first batch all files will be considered valid. If `latestFirst` is set to `true` and
-   * `maxFilesPerTrigger` is set, then this parameter will be ignored, because old files that are
-   * valid, and should be processed, may be ignored. Please refer to SPARK-19813 for details.
+   * `maxFilesPerTrigger` or `maxBytesPerTrigger` is set, then this parameter will be ignored,
+   * because old files that are valid, and should be processed, may be ignored. Please refer to
+   * SPARK-19813 for details.
    *
    * The max age is specified with respect to the timestamp of the latest file, and not the
    * timestamp of the current system. That this means if the last file has timestamp 1000, and the
@@ -74,6 +101,54 @@ class FileStreamOptions(parameters: CaseInsensitiveMap[String]) extends Logging 
    */
   val fileNameOnly: Boolean = withBooleanParameter("fileNameOnly", false)
 
+  /**
+   * The archive directory to move completed files. The option will be only effective when
+   * "cleanSource" is set to "archive".
+   *
+   * Note that the completed file will be moved to this archive directory with respecting to
+   * its own path.
+   *
+   * For example, if the path of source file is "/a/b/dataset.txt", and the path of archive
+   * directory is "/archived/here", file will be moved to "/archived/here/a/b/dataset.txt".
+   */
+  val sourceArchiveDir: Option[String] = parameters.get("sourceArchiveDir")
+
+  /**
+   * Defines how to clean up completed files. Available options are "archive", "delete", "off".
+   */
+  val cleanSource: CleanSourceMode.Value = {
+    val matchedMode = CleanSourceMode.fromString(parameters.get("cleanSource"))
+    if (matchedMode == CleanSourceMode.ARCHIVE && sourceArchiveDir.isEmpty) {
+      throw new IllegalArgumentException("Archive mode must be used with 'sourceArchiveDir' " +
+        "option.")
+    }
+    matchedMode
+  }
+
+  /**
+   * maximum number of files to cache to be processed in subsequent batches
+   */
+  val maxCachedFiles: Int = parameters.get("maxCachedFiles").map { str =>
+    Try(str.toInt).filter(_ >= 0).getOrElse {
+      throw new IllegalArgumentException(
+        s"Invalid value '$str' for option 'maxCachedFiles', must be an integer greater than or " +
+          "equal to 0")
+    }
+  }.getOrElse(10000)
+
+  /**
+   * ratio of cached input to max files/bytes to allow for listing from input source when
+   * there are fewer cached files/bytes than could be available to be read
+   */
+  val discardCachedInputRatio: Float = parameters.get("discardCachedInputRatio").map { str =>
+    Try(str.toFloat).filter(x => 0 <= x && x <= 1).getOrElse {
+      throw new IllegalArgumentException(
+        s"Invalid value '$str' for option 'discardCachedInputRatio', must be a positive float " +
+          "between 0 and 1"
+      )
+    }
+  }.getOrElse(0.2f)
+
   private def withBooleanParameter(name: String, default: Boolean) = {
     parameters.get(name).map { str =>
       try {
@@ -85,4 +160,15 @@ class FileStreamOptions(parameters: CaseInsensitiveMap[String]) extends Logging 
       }
     }.getOrElse(default)
   }
+}
+
+object CleanSourceMode extends Enumeration {
+  val ARCHIVE, DELETE, OFF = Value
+
+  def fromString(value: Option[String]): CleanSourceMode.Value = value.map { v =>
+    CleanSourceMode.values.find(_.toString == v.toUpperCase(Locale.ROOT))
+      .getOrElse(throw new IllegalArgumentException(
+        s"Invalid mode for clean source option $value." +
+        s" Must be one of ${CleanSourceMode.values.mkString(",")}"))
+  }.getOrElse(OFF)
 }

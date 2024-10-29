@@ -19,7 +19,7 @@ package org.apache.spark.deploy.k8s.features
 import java.io.File
 import java.nio.charset.StandardCharsets.UTF_8
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import com.google.common.io.Files
 import io.fabric8.kubernetes.api.model.ConfigMap
@@ -27,7 +27,6 @@ import io.fabric8.kubernetes.api.model.ConfigMap
 import org.apache.spark.{SparkConf, SparkFunSuite}
 import org.apache.spark.deploy.k8s._
 import org.apache.spark.deploy.k8s.Constants._
-import org.apache.spark.deploy.k8s.submit.JavaMainAppResource
 import org.apache.spark.util.{SparkConfWithEnv, Utils}
 
 class HadoopConfDriverFeatureStepSuite extends SparkFunSuite {
@@ -49,7 +48,7 @@ class HadoopConfDriverFeatureStepSuite extends SparkFunSuite {
     val confFiles = Set("core-site.xml", "hdfs-site.xml")
 
     confFiles.foreach { f =>
-      Files.write("some data", new File(confDir, f), UTF_8)
+      Files.asCharSink(new File(confDir, f), UTF_8).write("some data")
     }
 
     val sparkConf = new SparkConfWithEnv(Map(ENV_HADOOP_CONF_DIR -> confDir.getAbsolutePath()))

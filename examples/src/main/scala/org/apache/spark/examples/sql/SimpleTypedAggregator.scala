@@ -25,13 +25,13 @@ object SimpleTypedAggregator {
 
   def main(args: Array[String]): Unit = {
     val spark = SparkSession
-      .builder
+      .builder()
       .master("local")
       .appName("common typed aggregator implementations")
       .getOrCreate()
 
     import spark.implicits._
-    val ds = spark.range(20).select(('id % 3).as("key"), 'id).as[(Long, Long)]
+    val ds = spark.range(20).select(($"id" % 3).as("key"), $"id").as[(Long, Long)]
     println("input data:")
     ds.show()
 

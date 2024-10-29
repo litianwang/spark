@@ -22,11 +22,12 @@ import java.util.concurrent.ExecutionException
 import scala.concurrent.duration._
 
 import org.scalatest.concurrent.{Signaler, ThreadSignaler, TimeLimits}
-import org.scalatest.mockito.MockitoSugar
+import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark._
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.rpc._
+import org.apache.spark.util.{SslTestUtils, ThreadUtils}
 
 class NettyRpcEnvSuite extends RpcEnvSuite with MockitoSugar with TimeLimits {
 
@@ -52,7 +53,7 @@ class NettyRpcEnvSuite extends RpcEnvSuite with MockitoSugar with TimeLimits {
   }
 
   test("advertise address different from bind address") {
-    val sparkConf = new SparkConf()
+    val sparkConf = createSparkConf()
     val config = RpcEnvConfig(sparkConf, "test", "localhost", "example.com", 0,
       new SecurityManager(sparkConf), 0, false)
     val env = new NettyRpcEnvFactory().create(config)
@@ -72,7 +73,7 @@ class NettyRpcEnvSuite extends RpcEnvSuite with MockitoSugar with TimeLimits {
 
     val nettyEnv = env.asInstanceOf[NettyRpcEnv]
     val client = mock[TransportClient]
-    val senderAddress = RpcAddress("locahost", 12345)
+    val senderAddress = RpcAddress("localhost", 12345)
     val receiverAddress = RpcEndpointAddress("localhost", 54321, "test")
     val receiver = new NettyRpcEndpointRef(nettyEnv.conf, receiverAddress, nettyEnv)
 
@@ -94,7 +95,7 @@ class NettyRpcEnvSuite extends RpcEnvSuite with MockitoSugar with TimeLimits {
 
   test("StackOverflowError should be sent back and Dispatcher should survive") {
     val numUsableCores = 2
-    val conf = new SparkConf
+    val conf = createSparkConf()
     val config = RpcEnvConfig(
       conf,
       "test",
@@ -134,5 +135,54 @@ class NettyRpcEnvSuite extends RpcEnvSuite with MockitoSugar with TimeLimits {
       anotherEnv.shutdown()
       anotherEnv.awaitTermination()
     }
+  }
+
+
+  test("SPARK-31233: ask rpcEndpointRef in client mode timeout") {
+    var remoteRef: RpcEndpointRef = null
+    env.setupEndpoint("ask-remotely-server", new RpcEndpoint {
+      override val rpcEnv = env
+      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+        case Register(ref) =>
+          remoteRef = ref
+          context.reply("okay")
+        case msg: String =>
+          context.reply(msg)
+      }
+    })
+    val conf = createSparkConf()
+    val anotherEnv = createRpcEnv(conf, "remote", 0, clientMode = true)
+    // Use anotherEnv to find out the RpcEndpointRef
+    val rpcEndpointRef = anotherEnv.setupEndpointRef(env.address, "ask-remotely-server")
+    // Register a rpcEndpointRef in anotherEnv
+    val anotherRef = anotherEnv.setupEndpoint("receiver", new RpcEndpoint {
+      override val rpcEnv = anotherEnv
+      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+        case _ =>
+          Thread.sleep(1200)
+          context.reply("okay")
+      }
+    })
+    try {
+      val reply = rpcEndpointRef.askSync[String](Register(anotherRef))
+      assert("okay" === reply)
+      val timeout = "1s"
+      val answer = remoteRef.ask[String]("msg",
+        RpcTimeout(conf, Seq("spark.rpc.askTimeout", "spark.network.timeout"), timeout))
+      val thrown = intercept[RpcTimeoutException] {
+        ThreadUtils.awaitResult(answer, Duration(1300, MILLISECONDS))
+      }
+      val remoteAddr = remoteRef.asInstanceOf[NettyRpcEndpointRef].client.getChannel.remoteAddress
+      assert(thrown.getMessage.contains(remoteAddr.toString))
+    } finally {
+      anotherEnv.shutdown()
+      anotherEnv.awaitTermination()
+    }
+  }
+}
+
+class SslNettyRpcEnvSuite extends NettyRpcEnvSuite with MockitoSugar with TimeLimits {
+  override def createSparkConf(): SparkConf = {
+    SslTestUtils.updateWithSSLConfig(super.createSparkConf())
   }
 }

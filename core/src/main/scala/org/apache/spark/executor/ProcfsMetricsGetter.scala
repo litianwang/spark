@@ -18,16 +18,16 @@
 package org.apache.spark.executor
 
 import java.io._
-import java.nio.charset.Charset
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Paths}
 import java.util.Locale
 
-import scala.collection.mutable
-import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
 import scala.util.Try
 
-import org.apache.spark.{SparkEnv, SparkException}
+import org.apache.spark.SparkEnv
 import org.apache.spark.internal.{config, Logging}
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 
@@ -46,7 +46,7 @@ private[spark] class ProcfsMetricsGetter(procfsDir: String = "/proc/") extends L
   private val testing = Utils.isTesting
   private val pageSize = computePageSize()
   private var isAvailable: Boolean = isProcfsAvailable
-  private val pid = computePid()
+  private val currentProcessHandle = ProcessHandle.current()
 
   private lazy val isProcfsAvailable: Boolean = {
     if (testing) {
@@ -58,31 +58,9 @@ private[spark] class ProcfsMetricsGetter(procfsDir: String = "/proc/") extends L
           logWarning("Exception checking for procfs dir", ioe)
           false
       }
-      val shouldLogStageExecutorMetrics =
-        SparkEnv.get.conf.get(config.EVENT_LOG_STAGE_EXECUTOR_METRICS)
-      val shouldLogStageExecutorProcessTreeMetrics =
-        SparkEnv.get.conf.get(config.EVENT_LOG_PROCESS_TREE_METRICS)
-      procDirExists.get && shouldLogStageExecutorProcessTreeMetrics && shouldLogStageExecutorMetrics
-    }
-  }
-
-  private def computePid(): Int = {
-    if (!isAvailable || testing) {
-      return -1;
-    }
-    try {
-      // This can be simplified in java9:
-      // https://docs.oracle.com/javase/9/docs/api/java/lang/ProcessHandle.html
-      val cmd = Array("bash", "-c", "echo $PPID")
-      val out = Utils.executeAndGetOutput(cmd)
-      Integer.parseInt(out.split("\n")(0))
-    }
-    catch {
-      case e: SparkException =>
-        logWarning("Exception when trying to compute process tree." +
-          " As a result reporting of ProcessTree metrics is stopped", e)
-        isAvailable = false
-        -1
+      val shouldPollProcessTreeMetrics =
+        SparkEnv.get.conf.get(config.EXECUTOR_PROCESS_TREE_METRICS_ENABLED)
+      procDirExists.get && shouldPollProcessTreeMetrics
     }
   }
 
@@ -92,88 +70,31 @@ private[spark] class ProcfsMetricsGetter(procfsDir: String = "/proc/") extends L
     }
     try {
       val cmd = Array("getconf", "PAGESIZE")
-      val out = Utils.executeAndGetOutput(cmd)
+      val out = Utils.executeAndGetOutput(cmd.toImmutableArraySeq)
       Integer.parseInt(out.split("\n")(0))
     } catch {
       case e: Exception =>
-        logWarning("Exception when trying to compute pagesize, as a" +
+        logDebug("Exception when trying to compute pagesize, as a" +
           " result reporting of ProcessTree metrics is stopped")
         isAvailable = false
         0
     }
   }
 
-  private def computeProcessTree(): Set[Int] = {
-    if (!isAvailable || testing) {
-      return Set()
-    }
-    var ptree: Set[Int] = Set()
-    ptree += pid
-    val queue = mutable.Queue.empty[Int]
-    queue += pid
-    while ( !queue.isEmpty ) {
-      val p = queue.dequeue()
-      val c = getChildPids(p)
-      if (!c.isEmpty) {
-        queue ++= c
-        ptree ++= c.toSet
-      }
-    }
-    ptree
-  }
-
-  private def getChildPids(pid: Int): ArrayBuffer[Int] = {
-    try {
-      val builder = new ProcessBuilder("pgrep", "-P", pid.toString)
-      val process = builder.start()
-      val childPidsInInt = mutable.ArrayBuffer.empty[Int]
-      def appendChildPid(s: String): Unit = {
-        if (s != "") {
-          logTrace("Found a child pid:" + s)
-          childPidsInInt += Integer.parseInt(s)
-        }
-      }
-      val stdoutThread = Utils.processStreamByLine("read stdout for pgrep",
-        process.getInputStream, appendChildPid)
-      val errorStringBuilder = new StringBuilder()
-      val stdErrThread = Utils.processStreamByLine(
-        "stderr for pgrep",
-        process.getErrorStream,
-        line => errorStringBuilder.append(line))
-      val exitCode = process.waitFor()
-      stdoutThread.join()
-      stdErrThread.join()
-      val errorString = errorStringBuilder.toString()
-      // pgrep will have exit code of 1 if there are more than one child process
-      // and it will have a exit code of 2 if there is no child process
-      if (exitCode != 0 && exitCode > 2) {
-        val cmd = builder.command().toArray.mkString(" ")
-        logWarning(s"Process $cmd exited with code $exitCode and stderr: $errorString")
-        throw new SparkException(s"Process $cmd exited with code $exitCode")
-      }
-      childPidsInInt
-    } catch {
-      case e: Exception =>
-        logWarning("Exception when trying to compute process tree." +
-          " As a result reporting of ProcessTree metrics is stopped.", e)
-        isAvailable = false
-        mutable.ArrayBuffer.empty[Int]
-    }
-  }
-
-  def addProcfsMetricsFromOneProcess(
+  // Exposed for testing
+  private[executor] def addProcfsMetricsFromOneProcess(
       allMetrics: ProcfsMetrics,
-      pid: Int): ProcfsMetrics = {
+      pid: Long): ProcfsMetrics = {
 
     // The computation of RSS and Vmem are based on proc(5):
     // http://man7.org/linux/man-pages/man5/proc.5.html
     try {
       val pidDir = new File(procfsDir, pid.toString)
       def openReader(): BufferedReader = {
-        val f = new File(new File(procfsDir, pid.toString), procfsStatFile)
-        new BufferedReader(new InputStreamReader(new FileInputStream(f), Charset.forName("UTF-8")))
+        val f = new File(pidDir, procfsStatFile)
+        new BufferedReader(new InputStreamReader(new FileInputStream(f), UTF_8))
       }
-      Utils.tryWithResource(openReader) { in =>
+      Utils.tryWithResource(openReader()) { in =>
         val procInfo = in.readLine
         val procInfoSplit = procInfo.split(" ")
         val vmem = procInfoSplit(22).toLong
@@ -199,9 +120,18 @@ private[spark] class ProcfsMetricsGetter(procfsDir: String = "/proc/") extends L
       }
     } catch {
       case f: IOException =>
-        logWarning("There was a problem with reading" +
+        logDebug("There was a problem with reading" +
           " the stat file of the process. ", f)
-        ProcfsMetrics(0, 0, 0, 0, 0, 0)
+        throw f
+    }
+  }
+
+  private[executor] def computeProcessTree(): Set[Long] = {
+    if (!isAvailable) {
+      Set.empty
+    } else {
+      val children = currentProcessHandle.descendants().map(_.pid()).toList.asScala.toSet
+      children + currentProcessHandle.pid()
     }
   }
 
@@ -209,14 +139,19 @@ private[spark] class ProcfsMetricsGetter(procfsDir: String = "/proc/") extends L
     if (!isAvailable) {
       return ProcfsMetrics(0, 0, 0, 0, 0, 0)
     }
-    val pids = computeProcessTree
+    val pids = computeProcessTree()
     var allMetrics = ProcfsMetrics(0, 0, 0, 0, 0, 0)
     for (p <- pids) {
-      allMetrics = addProcfsMetricsFromOneProcess(allMetrics, p)
-      // if we had an error getting any of the metrics, we don't want to report partial metrics, as
-      // that would be misleading.
-      if (!isAvailable) {
-        return ProcfsMetrics(0, 0, 0, 0, 0, 0)
+      try {
+        allMetrics = addProcfsMetricsFromOneProcess(allMetrics, p)
+        // if we had an error getting any of the metrics, we don't want to
+        // report partial metrics, as that would be misleading.
+        if (!isAvailable) {
+          return ProcfsMetrics(0, 0, 0, 0, 0, 0)
+        }
+      } catch {
+        case _: IOException =>
+          return ProcfsMetrics(0, 0, 0, 0, 0, 0)
       }
     }
     allMetrics

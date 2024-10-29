@@ -16,20 +16,23 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.json
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.Path
 
-import org.apache.spark.sql.{AnalysisException, SparkSession}
-import org.apache.spark.sql.catalyst.expressions.ExprUtils
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.expressions.{Expression, ExprUtils}
 import org.apache.spark.sql.catalyst.json.JSONOptionsInRead
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
+import org.apache.spark.sql.connector.read.PartitionReaderFactory
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.PartitioningAwareFileIndex
 import org.apache.spark.sql.execution.datasources.json.JsonDataSource
-import org.apache.spark.sql.execution.datasources.v2.{FileScan, TextBasedFileScan}
-import org.apache.spark.sql.sources.v2.reader.PartitionReaderFactory
+import org.apache.spark.sql.execution.datasources.v2.TextBasedFileScan
+import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.SerializableConfiguration
 
 case class JsonScan(
@@ -38,8 +41,11 @@ case class JsonScan(
     dataSchema: StructType,
     readDataSchema: StructType,
     readPartitionSchema: StructType,
-    options: CaseInsensitiveStringMap)
-  extends TextBasedFileScan(sparkSession, fileIndex, readDataSchema, readPartitionSchema, options) {
+    options: CaseInsensitiveStringMap,
+    pushedFilters: Array[Filter],
+    partitionFilters: Seq[Expression] = Seq.empty,
+    dataFilters: Seq[Expression] = Seq.empty)
+  extends TextBasedFileScan(sparkSession, options) {
 
   private val parsedOptions = new JSONOptionsInRead(
     CaseInsensitiveMap(options.asScala.toMap),
@@ -50,22 +56,22 @@ case class JsonScan(
     JsonDataSource(parsedOptions).isSplitable && super.isSplitable(path)
   }
 
+  override def getFileUnSplittableReason(path: Path): String = {
+    assert(!isSplitable(path))
+    if (!super.isSplitable(path)) {
+      super.getFileUnSplittableReason(path)
+    } else {
+      "the json datasource is set multiLine mode"
+    }
+  }
+
   override def createReaderFactory(): PartitionReaderFactory = {
     // Check a field requirement for corrupt records here to throw an exception in a driver side
     ExprUtils.verifyColumnNameOfCorruptRecord(dataSchema, parsedOptions.columnNameOfCorruptRecord)
 
     if (readDataSchema.length == 1 &&
       readDataSchema.head.name == parsedOptions.columnNameOfCorruptRecord) {
-      throw new AnalysisException(
-        "Since Spark 2.3, the queries from raw JSON/CSV files are disallowed when the\n" +
-          "referenced columns only include the internal corrupt record column\n" +
-          s"(named _corrupt_record by default). For example:\n" +
-          "spark.read.schema(schema).json(file).filter($\"_corrupt_record\".isNotNull).count()\n" +
-          "and spark.read.schema(schema).json(file).select(\"_corrupt_record\").show().\n" +
-          "Instead, you can cache or save the parsed results and then send the same query.\n" +
-          "For example, val df = spark.read.schema(schema).json(file).cache() and then\n" +
-          "df.filter($\"_corrupt_record\".isNotNull).count()."
-      )
+      throw QueryCompilationErrors.queryFromRawFilesIncludeCorruptRecordColumnError()
     }
     val caseSensitiveMap = options.asCaseSensitiveMap.asScala.toMap
     // Hadoop Configurations are case sensitive.
@@ -75,6 +81,19 @@ case class JsonScan(
     // The partition values are already truncated in `FileScan.partitions`.
     // We should use `readPartitionSchema` as the partition schema here.
     JsonPartitionReaderFactory(sparkSession.sessionState.conf, broadcastedConf,
-      dataSchema, readDataSchema, readPartitionSchema, parsedOptions)
+      dataSchema, readDataSchema, readPartitionSchema, parsedOptions,
+      pushedFilters.toImmutableArraySeq)
+  }
+
+  override def equals(obj: Any): Boolean = obj match {
+    case j: JsonScan => super.equals(j) && dataSchema == j.dataSchema && options == j.options &&
+      equivalentFilters(pushedFilters, j.pushedFilters)
+    case _ => false
+  }
+
+  override def hashCode(): Int = super.hashCode()
+
+  override def getMetaData(): Map[String, String] = {
+    super.getMetaData() ++ Map("PushedFilters" -> pushedFilters.mkString("[", ", ", "]"))
   }
 }

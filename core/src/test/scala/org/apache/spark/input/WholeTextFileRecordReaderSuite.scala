@@ -21,26 +21,22 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
 
-import scala.collection.immutable.IndexedSeq
-
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.io.Text
 import org.apache.hadoop.io.compress.{CompressionCodecFactory, GzipCodec}
-import org.scalatest.BeforeAndAfterAll
 
 import org.apache.spark.{SparkConf, SparkContext, SparkFunSuite}
-import org.apache.spark.internal.Logging
-import org.apache.spark.util.Utils
 
 /**
  * Tests the correctness of
  * [[org.apache.spark.input.WholeTextFileRecordReader WholeTextFileRecordReader]]. A temporary
  * directory is created as fake input. Temporal storage would be deleted in the end.
  */
-class WholeTextFileRecordReaderSuite extends SparkFunSuite with BeforeAndAfterAll with Logging {
+class WholeTextFileRecordReaderSuite extends SparkFunSuite {
   private var sc: SparkContext = _
   private var factory: CompressionCodecFactory = _
 
-  override def beforeAll() {
+  override def beforeAll(): Unit = {
     // Hadoop's FileSystem caching does not use the Configuration as part of its cache key, which
     // can cause Filesystem.get(Configuration) to return a cached instance created with a different
     // configuration than the one passed to get() (see HADOOP-8490 for more details). This caused
@@ -59,7 +55,7 @@ class WholeTextFileRecordReaderSuite extends SparkFunSuite with BeforeAndAfterAl
     factory = new CompressionCodecFactory(sc.hadoopConfiguration)
   }
 
-  override def afterAll() {
+  override def afterAll(): Unit = {
     try {
       sc.stop()
     } finally {
@@ -71,6 +67,7 @@ class WholeTextFileRecordReaderSuite extends SparkFunSuite with BeforeAndAfterAl
                                compress: Boolean) = {
     val out = if (compress) {
       val codec = new GzipCodec
+      codec.setConf(new Configuration())
       val path = s"${inputDir.toString}/$fileName${codec.getDefaultExtension}"
       codec.createOutputStream(new DataOutputStream(new FileOutputStream(path)))
     } else {
@@ -98,7 +95,7 @@ class WholeTextFileRecordReaderSuite extends SparkFunSuite with BeforeAndAfterAl
 
       val res = sc.wholeTextFiles(dir.toString, 3).collect()
 
-      assert(res.size === WholeTextFileRecordReaderSuite.fileNames.size,
+      assert(res.length === WholeTextFileRecordReaderSuite.fileNames.length,
         "Number of files read out does not fit with the actual value.")
 
       for ((filename, contents) <- res) {
@@ -121,7 +118,7 @@ class WholeTextFileRecordReaderSuite extends SparkFunSuite with BeforeAndAfterAl
 
       val res = sc.wholeTextFiles(dir.toString, 3).collect()
 
-      assert(res.size === WholeTextFileRecordReaderSuite.fileNames.size,
+      assert(res.length === WholeTextFileRecordReaderSuite.fileNames.length,
         "Number of files read out does not fit with the actual value.")
 
       for ((filename, contents) <- res) {
@@ -146,6 +143,6 @@ object WholeTextFileRecordReaderSuite {
   private val fileLengths = Array(10, 100, 1000)
 
   private val files = fileLengths.zip(fileNames).map { case (upperBound, filename) =>
-    filename -> Stream.continually(testWords.toList.toStream).flatten.take(upperBound).toArray
+    filename -> LazyList.continually(testWords.toList.to(LazyList)).flatten.take(upperBound).toArray
   }.toMap
 }

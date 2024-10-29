@@ -20,13 +20,19 @@ package org.apache.spark.sql
 import org.scalatest.concurrent.TimeLimits
 import org.scalatest.time.SpanSugar._
 
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.columnar.{InMemoryRelation, InMemoryTableScanExec}
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.tags.SlowSQLTest
 
-
-class DatasetCacheSuite extends QueryTest with SharedSQLContext with TimeLimits {
+@SlowSQLTest
+class DatasetCacheSuite extends QueryTest
+  with SharedSparkSession
+  with TimeLimits
+  with AdaptiveSparkPlanHelper {
   import testImplicits._
 
   /**
@@ -36,7 +42,8 @@ class DatasetCacheSuite extends QueryTest with SharedSQLContext with TimeLimits 
     val plan = df.queryExecution.withCachedData
     assert(plan.isInstanceOf[InMemoryRelation])
     val internalPlan = plan.asInstanceOf[InMemoryRelation].cacheBuilder.cachedPlan
-    assert(internalPlan.find(_.isInstanceOf[InMemoryTableScanExec]).size == numOfCachesDependedUpon)
+    assert(find(internalPlan)(_.isInstanceOf[InMemoryTableScanExec]).size
+      == numOfCachesDependedUpon)
   }
 
   test("get storage level") {
@@ -97,18 +104,19 @@ class DatasetCacheSuite extends QueryTest with SharedSQLContext with TimeLimits 
   test("persist and then groupBy columns asKey, map") {
     val ds = Seq(("a", 10), ("a", 20), ("b", 1), ("b", 2), ("c", 1)).toDS()
     val grouped = ds.groupByKey(_._1)
-    val agged = grouped.mapGroups { case (g, iter) => (g, iter.map(_._2).sum) }
-    agged.persist()
+    val aggregated = grouped.mapGroups { (g, iter) => (g, iter.map(_._2).sum) }
+    aggregated.persist()
 
     checkDataset(
-      agged.filter(_._1 == "b"),
+      aggregated.filter(_._1 == "b"),
       ("b", 3))
-    assertCached(agged.filter(_._1 == "b"))
+    assertCached(aggregated.filter(_._1 == "b"))
 
     ds.unpersist(blocking = true)
     assert(ds.storageLevel == StorageLevel.NONE, "The Dataset ds should not be cached.")
-    agged.unpersist(blocking = true)
-    assert(agged.storageLevel == StorageLevel.NONE, "The Dataset agged should not be cached.")
+    aggregated.unpersist(blocking = true)
+    assert(aggregated.storageLevel == StorageLevel.NONE,
+           "The Dataset aggregated should not be cached.")
   }
 
   test("persist and then withColumn") {
@@ -158,8 +166,8 @@ class DatasetCacheSuite extends QueryTest with SharedSQLContext with TimeLimits 
 
   test("SPARK-24596 Non-cascading Cache Invalidation") {
     val df = Seq(("a", 1), ("b", 2)).toDF("s", "i")
-    val df2 = df.filter('i > 1)
-    val df3 = df.filter('i < 2)
+    val df2 = df.filter($"i" > 1)
+    val df3 = df.filter($"i" < 2)
 
     df2.cache()
     df.cache()
@@ -178,8 +186,8 @@ class DatasetCacheSuite extends QueryTest with SharedSQLContext with TimeLimits 
     val expensiveUDF = udf({ x: Int => Thread.sleep(5000); x })
     val df = spark.range(0, 5).toDF("a")
     val df1 = df.withColumn("b", expensiveUDF($"a"))
-    val df2 = df1.groupBy('a).agg(sum('b))
-    val df3 = df.agg(sum('a))
+    val df2 = df1.groupBy($"a").agg(sum($"b"))
+    val df3 = df.agg(sum($"a"))
 
     df1.cache()
     df2.cache()
@@ -192,16 +200,16 @@ class DatasetCacheSuite extends QueryTest with SharedSQLContext with TimeLimits 
 
     // df1 un-cached; df2's cache plan stays the same
     assert(df1.storageLevel == StorageLevel.NONE)
-    assertCacheDependency(df1.groupBy('a).agg(sum('b)))
+    assertCacheDependency(df1.groupBy($"a").agg(sum($"b")))
 
-    val df4 = df1.groupBy('a).agg(sum('b)).agg(sum("sum(b)"))
+    val df4 = df1.groupBy($"a").agg(sum($"b")).agg(sum("sum(b)"))
     assertCached(df4)
     // reuse loaded cache
     failAfter(3.seconds) {
       checkDataset(df4, Row(10))
     }
 
-    val df5 = df.agg(sum('a)).filter($"sum(a)" > 1)
+    val df5 = df.agg(sum($"a")).filter($"sum(a)" > 1)
     assertCached(df5)
     // first time use, load cache
     checkDataset(df5, Row(10))
@@ -209,8 +217,8 @@ class DatasetCacheSuite extends QueryTest with SharedSQLContext with TimeLimits 
 
   test("SPARK-26708 Cache data and cached plan should stay consistent") {
     val df = spark.range(0, 5).toDF("a")
-    val df1 = df.withColumn("b", 'a + 1)
-    val df2 = df.filter('a > 1)
+    val df1 = df.withColumn("b", $"a" + 1)
+    val df2 = df.filter($"a" > 1)
 
     df.cache()
     // Add df1 to the CacheManager; the buffer is currently empty.
@@ -244,6 +252,64 @@ class DatasetCacheSuite extends QueryTest with SharedSQLContext with TimeLimits 
       case i: InMemoryRelation => i.cacheBuilder.cachedPlan
     }
     assert(df2LimitInnerPlan.isDefined &&
-      df2LimitInnerPlan.get.find(_.isInstanceOf[InMemoryTableScanExec]).isEmpty)
+      !df2LimitInnerPlan.get.exists(_.isInstanceOf[InMemoryTableScanExec]))
+  }
+
+  test("SPARK-27739 Save stats from optimized plan") {
+    withTable("a") {
+      spark.range(4)
+        .selectExpr("id", "id % 2 AS p")
+        .write
+        .partitionBy("p")
+        .saveAsTable("a")
+
+      val df = sql("SELECT * FROM a WHERE p = 0")
+      df.cache()
+      df.count()
+      df.queryExecution.withCachedData match {
+        case i: InMemoryRelation =>
+          // Optimized plan has non-default size in bytes
+          assert(i.statsOfPlanToCache.sizeInBytes !==
+            df.sparkSession.sessionState.conf.defaultSizeInBytes)
+      }
+    }
+  }
+
+  test("SPARK-44653: non-trivial DataFrame unions should not break caching") {
+    val df1 = Seq(1 -> 1).toDF("i", "j")
+    val df2 = Seq(2 -> 2).toDF("i", "j")
+    val df3 = Seq(3 -> 3).toDF("i", "j")
+
+    withSQLConf(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING.key -> "false") {
+      withClue("positive: union by position") {
+        val unionDf = df1.union(df2).select($"i")
+        unionDf.cache()
+        val finalDf = unionDf.union(df3.select($"i"))
+        assert(finalDf.queryExecution.executedPlan.exists(_.isInstanceOf[InMemoryTableScanExec]))
+      }
+
+      withClue("positive: union by name") {
+        val unionDf = df1.unionByName(df2).select($"i")
+        unionDf.cache()
+        val finalDf = unionDf.unionByName(df3.select($"i"))
+        assert(finalDf.queryExecution.executedPlan.exists(_.isInstanceOf[InMemoryTableScanExec]))
+      }
+
+      withClue("negative: union by position") {
+        val unionDf = df1.union(df2)
+        unionDf.cache()
+        val finalDf = unionDf.union(df3)
+        // It's by design to break caching here.
+        assert(!finalDf.queryExecution.executedPlan.exists(_.isInstanceOf[InMemoryTableScanExec]))
+      }
+
+      withClue("negative: union by name") {
+        val unionDf = df1.unionByName(df2)
+        unionDf.cache()
+        val finalDf = unionDf.unionByName(df3)
+        // It's by design to break caching here.
+        assert(!finalDf.queryExecution.executedPlan.exists(_.isInstanceOf[InMemoryTableScanExec]))
+      }
+    }
   }
 }

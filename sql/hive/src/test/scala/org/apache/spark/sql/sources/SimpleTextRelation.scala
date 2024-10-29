@@ -23,10 +23,12 @@ import org.apache.hadoop.mapreduce.{Job, TaskAttemptContext}
 
 import org.apache.spark.sql.{sources, SparkSession}
 import org.apache.spark.sql.catalyst.{expressions, InternalRow}
-import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, GenericInternalRow, InterpretedPredicate, InterpretedProjection, JoinedRow, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, GenericInternalRow, InterpretedProjection, JoinedRow, Literal, Predicate}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.types.{DataType, StructType}
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.SerializableConfiguration
 
 class SimpleTextSource extends TextBasedFileFormat with DataSourceRegister {
@@ -66,11 +68,11 @@ class SimpleTextSource extends TextBasedFileFormat with DataSourceRegister {
       options: Map[String, String],
       hadoopConf: Configuration): (PartitionedFile) => Iterator[InternalRow] = {
     SimpleTextRelation.lastHadoopConf = Option(hadoopConf)
-    SimpleTextRelation.requiredColumns = requiredSchema.fieldNames
+    SimpleTextRelation.requiredColumns = requiredSchema.fieldNames.toImmutableArraySeq
     SimpleTextRelation.pushedFilters = filters.toSet
 
     val fieldTypes = dataSchema.map(_.dataType)
-    val inputAttributes = dataSchema.toAttributes
+    val inputAttributes = DataTypeUtils.toAttributes(dataSchema)
     val outputAttributes = requiredSchema.flatMap { field =>
       inputAttributes.find(_.name == field.name)
     }
@@ -88,7 +90,7 @@ class SimpleTextSource extends TextBasedFileFormat with DataSourceRegister {
             val attribute = inputAttributes.find(_.name == column).get
             expressions.GreaterThan(attribute, literal)
         }.reduceOption(expressions.And).getOrElse(Literal(true))
-        InterpretedPredicate.create(filterCondition, inputAttributes)
+        Predicate.create(filterCondition, inputAttributes)
       }
 
       // Uses a simple projection to simulate column pruning
@@ -106,7 +108,8 @@ class SimpleTextSource extends TextBasedFileFormat with DataSourceRegister {
         }.filter(predicate.eval).map(projection)
 
       // Appends partition values
-      val fullOutput = requiredSchema.toAttributes ++ partitionSchema.toAttributes
+      val fullOutput = DataTypeUtils.toAttributes(requiredSchema) ++
+        DataTypeUtils.toAttributes(partitionSchema)
       val joinedRow = new JoinedRow()
       val appendPartitionColumns = GenerateUnsafeProjection.generate(fullOutput, fullOutput)
 
@@ -117,7 +120,7 @@ class SimpleTextSource extends TextBasedFileFormat with DataSourceRegister {
   }
 }
 
-class SimpleTextOutputWriter(path: String, dataSchema: StructType, context: TaskAttemptContext)
+class SimpleTextOutputWriter(val path: String, dataSchema: StructType, context: TaskAttemptContext)
   extends OutputWriter {
 
   private val writer = CodecStreams.createOutputStreamWriter(context, new Path(path))

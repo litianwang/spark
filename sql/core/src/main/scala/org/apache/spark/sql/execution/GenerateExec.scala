@@ -25,15 +25,16 @@ import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.metric.SQLMetrics
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * For lazy computing, be sure the generator.terminate() called in the very last
  * TODO reusing the CompletionIterator?
  */
-private[execution] sealed case class LazyIterator(func: () => TraversableOnce[InternalRow])
+private[execution] sealed case class LazyIterator(func: () => IterableOnce[InternalRow])
   extends Iterator[InternalRow] {
 
-  lazy val results: Iterator[InternalRow] = func().toIterator
+  lazy val results: Iterator[InternalRow] = func().iterator
   override def hasNext: Boolean = results.hasNext
   override def next(): InternalRow = results.next()
 }
@@ -68,7 +69,7 @@ case class GenerateExec(
   override lazy val metrics = Map(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
 
-  override def producedAttributes: AttributeSet = AttributeSet(output)
+  override def producedAttributes: AttributeSet = AttributeSet(generatorOutput)
 
   override def outputPartitioning: Partitioning = child.outputPartitioning
 
@@ -78,6 +79,10 @@ case class GenerateExec(
     // boundGenerator.terminate() should be triggered after all of the rows in the partition
     val numOutputRows = longMetric("numOutputRows")
     child.execute().mapPartitionsWithIndexInternal { (index, iter) =>
+      boundGenerator.foreach {
+        case n: Nondeterministic => n.initialize(index)
+        case _ =>
+      }
       val generatorNullRow = new GenericInternalRow(generator.elementSchema.length)
       val rows = if (requiredChildOutput.nonEmpty) {
 
@@ -93,10 +98,10 @@ case class GenerateExec(
           // we should always set the left (required child output)
           joinedRow.withLeft(pruneChildForResult(row))
           val outputRows = boundGenerator.eval(row)
-          if (outer && outputRows.isEmpty) {
+          if (outer && outputRows.iterator.isEmpty) {
             joinedRow.withRight(generatorNullRow) :: Nil
           } else {
-            outputRows.map(joinedRow.withRight)
+            outputRows.iterator.map(joinedRow.withRight)
           }
         } ++ LazyIterator(() => boundGenerator.terminate()).map { row =>
           // we leave the left side as the last element of its child output
@@ -106,7 +111,7 @@ case class GenerateExec(
       } else {
         iter.flatMap { row =>
           val outputRows = boundGenerator.eval(row)
-          if (outer && outputRows.isEmpty) {
+          if (outer && outputRows.iterator.isEmpty) {
             Seq(generatorNullRow)
           } else {
             outputRows
@@ -124,7 +129,7 @@ case class GenerateExec(
     }
   }
 
-  override def supportCodegen: Boolean = false
+  override def supportCodegen: Boolean = generator.supportCodegen
 
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
     child.asInstanceOf[CodegenSupport].inputRDDs()
@@ -137,16 +142,13 @@ case class GenerateExec(
   override def needCopyResult: Boolean = true
 
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
-    // Add input rows to the values when we are joining
-    val values = if (requiredChildOutput.nonEmpty) {
-      input
-    } else {
-      Seq.empty
-    }
-
+    val requiredAttrSet = AttributeSet(requiredChildOutput)
+    val requiredInput = child.output.zip(input).filter {
+      case (attr, _) => requiredAttrSet.contains(attr)
+    }.map(_._2)
     boundGenerator match {
-      case e: CollectionGenerator => codeGenCollection(ctx, e, values, row)
-      case g => codeGenTraversableOnce(ctx, g, values, row)
+      case e: CollectionGenerator => codeGenCollection(ctx, e, requiredInput)
+      case g => codeGenIterableOnce(ctx, g, requiredInput)
     }
   }
 
@@ -156,8 +158,7 @@ case class GenerateExec(
   private def codeGenCollection(
       ctx: CodegenContext,
       e: CollectionGenerator,
-      input: Seq[ExprCode],
-      row: ExprCode): String = {
+      input: Seq[ExprCode]): String = {
 
     // Generate code for the generator.
     val data = e.genCode(ctx)
@@ -186,7 +187,7 @@ case class GenerateExec(
       case ArrayType(st: StructType, nullable) if e.inline =>
         val row = codeGenAccessor(ctx, data.value, "col", index, st, nullable, checks)
         val fieldChecks = checks ++ optionalCode(nullable, row.isNull)
-        val columns = st.fields.toSeq.zipWithIndex.map { case (f, i) =>
+        val columns = st.fields.toImmutableArraySeq.zipWithIndex.map { case (f, i) =>
           codeGenAccessor(
             ctx,
             row.value,
@@ -239,13 +240,12 @@ case class GenerateExec(
   }
 
   /**
-   * Generate code for a regular [[TraversableOnce]] returning [[Generator]].
+   * Generate code for a regular [[IterableOnce]] returning [[Generator]].
    */
-  private def codeGenTraversableOnce(
+  private def codeGenIterableOnce(
       ctx: CodegenContext,
       e: Expression,
-      input: Seq[ExprCode],
-      row: ExprCode): String = {
+      requiredInput: Seq[ExprCode]): String = {
 
     // Generate the code for the generator
     val data = e.genCode(ctx)
@@ -259,7 +259,7 @@ case class GenerateExec(
     val checks = optionalCode(outer, s"!$hasNext")
     val values = e.dataType match {
       case ArrayType(st: StructType, nullable) =>
-        st.fields.toSeq.zipWithIndex.map { case (f, i) =>
+        st.fields.toImmutableArraySeq.zipWithIndex.map { case (f, i) =>
           codeGenAccessor(ctx, current, s"st_col${i}", s"$i", f.dataType, f.nullable, checks)
         }
     }
@@ -273,24 +273,24 @@ case class GenerateExec(
       val outerVal = ctx.freshName("outer")
       s"""
          |${data.code}
-         |scala.collection.Iterator<InternalRow> $iterator = ${data.value}.toIterator();
+         |scala.collection.Iterator<InternalRow> $iterator = ${data.value}.iterator();
          |boolean $outerVal = true;
          |while ($iterator.hasNext() || $outerVal) {
          |  $numOutput.add(1);
          |  boolean $hasNext = $iterator.hasNext();
          |  InternalRow $current = (InternalRow)($hasNext? $iterator.next() : null);
          |  $outerVal = false;
-         |  ${consume(ctx, input ++ values)}
+         |  ${consume(ctx, requiredInput ++ values)}
          |}
       """.stripMargin
     } else {
       s"""
          |${data.code}
-         |scala.collection.Iterator<InternalRow> $iterator = ${data.value}.toIterator();
+         |scala.collection.Iterator<InternalRow> $iterator = ${data.value}.iterator();
          |while ($iterator.hasNext()) {
          |  $numOutput.add(1);
          |  InternalRow $current = (InternalRow)($iterator.next());
-         |  ${consume(ctx, input ++ values)}
+         |  ${consume(ctx, requiredInput ++ values)}
          |}
       """.stripMargin
     }
@@ -328,4 +328,7 @@ case class GenerateExec(
     if (condition) Seq(code)
     else Seq.empty
   }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): GenerateExec =
+    copy(child = newChild)
 }

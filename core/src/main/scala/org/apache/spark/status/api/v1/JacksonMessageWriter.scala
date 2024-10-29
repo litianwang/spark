@@ -19,15 +19,14 @@ package org.apache.spark.status.api.v1
 import java.io.OutputStream
 import java.lang.annotation.Annotation
 import java.lang.reflect.Type
-import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.{Calendar, Locale, SimpleTimeZone}
-import javax.ws.rs.Produces
-import javax.ws.rs.core.{MediaType, MultivaluedMap}
-import javax.ws.rs.ext.{MessageBodyWriter, Provider}
 
 import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.databind.{ObjectMapper, SerializationFeature}
+import jakarta.ws.rs.Produces
+import jakarta.ws.rs.core.{MediaType, MultivaluedMap}
+import jakarta.ws.rs.ext.{MessageBodyWriter, Provider}
 
 /**
  * This class converts the POJO metric responses into json, using jackson.

@@ -21,14 +21,15 @@ import java.nio.charset.{Charset, StandardCharsets}
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.mapreduce.TaskAttemptContext
 
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.{ENCODING, PATH}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.json.{JacksonGenerator, JSONOptions, JSONOptionsInRead}
 import org.apache.spark.sql.execution.datasources.{CodecStreams, OutputWriter}
 import org.apache.spark.sql.types.StructType
 
 class JsonOutputWriter(
-    path: String,
+    val path: String,
     options: JSONOptions,
     dataSchema: StructType,
     context: TaskAttemptContext)
@@ -39,25 +40,24 @@ class JsonOutputWriter(
     case None => StandardCharsets.UTF_8
   }
 
-  if (JSONOptionsInRead.blacklist.contains(encoding)) {
-    logWarning(s"The JSON file ($path) was written in the encoding ${encoding.displayName()}" +
-      " which can be read back by Spark only if multiLine is enabled.")
+  if (JSONOptionsInRead.denyList.contains(encoding)) {
+    logWarning(log"The JSON file (${MDC(PATH, path)}) was written in the encoding " +
+      log"${MDC(ENCODING, encoding.displayName())} which can be read back by Spark only " +
+      log"if multiLine is enabled.")
   }
 
-  private var jacksonGenerator: Option[JacksonGenerator] = None
+  private val writer = CodecStreams.createOutputStreamWriter(context, new Path(path), encoding)
+
+  // create the Generator without separator inserted between 2 records
+  private[this] val gen = new JacksonGenerator(dataSchema, writer, options)
 
   override def write(row: InternalRow): Unit = {
-    val gen = jacksonGenerator.getOrElse {
-      val os = CodecStreams.createOutputStreamWriter(context, new Path(path), encoding)
-      // create the Generator without separator inserted between 2 records
-      val newGen = new JacksonGenerator(dataSchema, os, options)
-      jacksonGenerator = Some(newGen)
-      newGen
-    }
-
     gen.write(row)
     gen.writeLineEnding()
   }
 
-  override def close(): Unit = jacksonGenerator.foreach(_.close())
+  override def close(): Unit = {
+    gen.close()
+    writer.close()
+  }
 }

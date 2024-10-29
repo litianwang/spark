@@ -17,16 +17,21 @@
 
 package org.apache.spark.sql.util;
 
-import org.apache.spark.annotation.Experimental;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+
+import org.apache.spark.annotation.Experimental;
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.internal.LogKeys;
+import org.apache.spark.internal.MDC;
+import org.apache.spark.SparkIllegalArgumentException;
+import org.apache.spark.SparkUnsupportedOperationException;
 
 /**
  * Case-insensitive map of string keys to string values.
@@ -35,12 +40,13 @@ import java.util.Set;
  * <p>
  * Methods that return keys in this map, like {@link #entrySet()} and {@link #keySet()}, return
  * keys converted to lower case. This map doesn't allow null key.
+ *
+ * @since 3.0.0
  */
 @Experimental
 public class CaseInsensitiveStringMap implements Map<String, String> {
-  private final Logger logger = LoggerFactory.getLogger(CaseInsensitiveStringMap.class);
-
-  private String unsupportedOperationMsg = "CaseInsensitiveStringMap is read-only.";
+  private static final SparkLogger logger =
+    SparkLoggerFactory.getLogger(CaseInsensitiveStringMap.class);
 
   public static CaseInsensitiveStringMap empty() {
     return new CaseInsensitiveStringMap(new HashMap<>(0));
@@ -56,8 +62,8 @@ public class CaseInsensitiveStringMap implements Map<String, String> {
     for (Map.Entry<String, String> entry : originalMap.entrySet()) {
       String key = toLowerCase(entry.getKey());
       if (delegate.containsKey(key)) {
-        logger.warn("Converting duplicated key " + entry.getKey() +
-                " into CaseInsensitiveStringMap.");
+        logger.warn("Converting duplicated key {} into CaseInsensitiveStringMap.",
+          MDC.of(LogKeys.KEY$.MODULE$, entry.getKey()));
       }
       delegate.put(key, entry.getValue());
     }
@@ -94,22 +100,22 @@ public class CaseInsensitiveStringMap implements Map<String, String> {
 
   @Override
   public String put(String key, String value) {
-    throw new UnsupportedOperationException(unsupportedOperationMsg);
+    throw new SparkUnsupportedOperationException("_LEGACY_ERROR_TEMP_3132");
   }
 
   @Override
   public String remove(Object key) {
-    throw new UnsupportedOperationException(unsupportedOperationMsg);
+    throw new SparkUnsupportedOperationException("_LEGACY_ERROR_TEMP_3132");
   }
 
   @Override
   public void putAll(Map<? extends String, ? extends String> m) {
-    throw new UnsupportedOperationException(unsupportedOperationMsg);
+    throw new SparkUnsupportedOperationException("_LEGACY_ERROR_TEMP_3132");
   }
 
   @Override
   public void clear() {
-    throw new UnsupportedOperationException(unsupportedOperationMsg);
+    throw new SparkUnsupportedOperationException("_LEGACY_ERROR_TEMP_3132");
   }
 
   @Override
@@ -141,7 +147,7 @@ public class CaseInsensitiveStringMap implements Map<String, String> {
     } else if (value.equalsIgnoreCase("false")) {
       return false;
     } else {
-      throw new IllegalArgumentException(value + " is not a boolean string.");
+      throw new SparkIllegalArgumentException("_LEGACY_ERROR_TEMP_3206", Map.of("value", value));
     }
   }
 
@@ -177,5 +183,22 @@ public class CaseInsensitiveStringMap implements Map<String, String> {
    */
   public Map<String, String> asCaseSensitiveMap() {
     return Collections.unmodifiableMap(original);
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    CaseInsensitiveStringMap that = (CaseInsensitiveStringMap) o;
+    return delegate.equals(that.delegate);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(delegate);
   }
 }

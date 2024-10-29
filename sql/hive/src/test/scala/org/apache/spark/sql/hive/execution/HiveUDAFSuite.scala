@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.hive.execution
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.hive.ql.udf.UDAFPercentile
 import org.apache.hadoop.hive.ql.udf.generic.{AbstractGenericUDAFResolver, GenericUDAFEvaluator, GenericUDAFMax}
@@ -28,13 +28,19 @@ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectIn
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo
 import test.org.apache.spark.sql.MyDoubleAvg
 
+import org.apache.spark.SPARK_DOC_ROOT
 import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
+import org.apache.spark.sql.catalyst.expressions.Cast._
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.aggregate.ObjectHashAggregateExec
 import org.apache.spark.sql.hive.test.TestHiveSingleton
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SQLTestUtils
+import org.apache.spark.tags.SlowHiveTest
 
-class HiveUDAFSuite extends QueryTest with TestHiveSingleton with SQLTestUtils {
+@SlowHiveTest
+class HiveUDAFSuite extends QueryTest
+  with TestHiveSingleton with SQLTestUtils with AdaptiveSparkPlanHelper {
   import testImplicits._
 
   protected override def beforeAll(): Unit = {
@@ -63,7 +69,7 @@ class HiveUDAFSuite extends QueryTest with TestHiveSingleton with SQLTestUtils {
   test("built-in Hive UDAF") {
     val df = sql("SELECT key % 2, hive_max(key) FROM t GROUP BY key % 2")
 
-    val aggs = df.queryExecution.executedPlan.collect {
+    val aggs = collect(df.queryExecution.executedPlan) {
       case agg: ObjectHashAggregateExec => agg
     }
 
@@ -80,7 +86,7 @@ class HiveUDAFSuite extends QueryTest with TestHiveSingleton with SQLTestUtils {
   test("customized Hive UDAF") {
     val df = sql("SELECT key % 2, mock(value) FROM t GROUP BY key % 2")
 
-    val aggs = df.queryExecution.executedPlan.collect {
+    val aggs = collect(df.queryExecution.executedPlan) {
       case agg: ObjectHashAggregateExec => agg
     }
 
@@ -99,7 +105,7 @@ class HiveUDAFSuite extends QueryTest with TestHiveSingleton with SQLTestUtils {
       spark.range(100).createTempView("v")
       val df = sql("SELECT id % 2, mock2(id) FROM v GROUP BY id % 2")
 
-      val aggs = df.queryExecution.executedPlan.collect {
+      val aggs = collect(df.queryExecution.executedPlan) {
         case agg: ObjectHashAggregateExec => agg
       }
 
@@ -141,11 +147,16 @@ class HiveUDAFSuite extends QueryTest with TestHiveSingleton with SQLTestUtils {
       withUserDefinedFunction("testUDAFPercentile" -> true) {
         // non-deterministic children of Hive UDAF
         sql(s"CREATE TEMPORARY FUNCTION testUDAFPercentile AS '${classOf[UDAFPercentile].getName}'")
-        val e1 = intercept[AnalysisException] {
-          sql("SELECT testUDAFPercentile(x, rand()) from view1 group by y")
-        }.getMessage
-        assert(Seq("nondeterministic expression",
-          "should not appear in the arguments of an aggregate function").forall(e1.contains))
+        checkError(
+          exception = intercept[AnalysisException] {
+            sql("SELECT testUDAFPercentile(x, rand()) from view1 group by y")
+          },
+          condition = "AGGREGATE_FUNCTION_WITH_NONDETERMINISTIC_EXPRESSION",
+          parameters = Map("sqlExpr" -> "\"testUDAFPercentile( x, rand())\""),
+          context = ExpectedContext(
+            fragment = "rand()",
+            start = 29,
+            stop = 34))
       }
     }
   }
@@ -157,6 +168,29 @@ class HiveUDAFSuite extends QueryTest with TestHiveSingleton with SQLTestUtils {
       sql("insert into abc values (1)")
       checkAnswer(sql("select histogram_numeric(a,2) from abc"), Row(Row(1.0, 1.0) :: Nil))
       checkAnswer(sql("select histogram_numeric(a,2) from abc where a=3"), Row(null))
+    }
+  }
+
+  test("SPARK-32243: Spark UDAF Invalid arguments number error should throw earlier") {
+    // func need two arguments
+    val functionName = "longProductSum"
+    val functionClass = "org.apache.spark.sql.hive.execution.LongProductSum"
+    withUserDefinedFunction(functionName -> true) {
+      sql(s"CREATE TEMPORARY FUNCTION $functionName AS '$functionClass'")
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"SELECT $functionName(100)")
+        },
+        condition = "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
+        parameters = Map(
+          "functionName" -> toSQLId("longProductSum"),
+          "expectedNum" -> "2",
+          "actualNum" -> "1",
+          "docroot" -> SPARK_DOC_ROOT),
+        context = ExpectedContext(
+          fragment = "longProductSum(100)",
+          start = 7,
+          stop = 25))
     }
   }
 }

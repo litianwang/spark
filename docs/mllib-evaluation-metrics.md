@@ -9,9 +9,9 @@ license: |
   The ASF licenses this file to You under the Apache License, Version 2.0
   (the "License"); you may not use this file except in compliance with
   the License.  You may obtain a copy of the License at
- 
+
      http://www.apache.org/licenses/LICENSE-2.0
- 
+
   Unless required by applicable law or agreed to in writing, software
   distributed under the License is distributed on an "AS IS" BASIS,
   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -76,7 +76,7 @@ plots (recall, false positive rate) points.
 
 **Available metrics**
 
-<table class="table">
+<table>
   <thead>
     <tr><th>Metric</th><th>Definition</th></tr>
   </thead>
@@ -116,8 +116,14 @@ plots (recall, false positive rate) points.
 The following code snippets illustrate how to load a sample dataset, train a binary classification algorithm on the
 data, and evaluate the performance of the algorithm by several binary evaluation metrics.
 
+<div data-lang="python" markdown="1">
+Refer to the [`BinaryClassificationMetrics` Python docs](api/python/reference/api/pyspark.mllib.evaluation.BinaryClassificationMetrics.html) and [`LogisticRegressionWithLBFGS` Python docs](api/python/reference/api/pyspark.mllib.classification.LogisticRegressionWithLBFGS.html) for more details on the API.
+
+{% include_example python/mllib/binary_classification_metrics_example.py %}
+</div>
+
 <div data-lang="scala" markdown="1">
-Refer to the [`LogisticRegressionWithLBFGS` Scala docs](api/scala/index.html#org.apache.spark.mllib.classification.LogisticRegressionWithLBFGS) and [`BinaryClassificationMetrics` Scala docs](api/scala/index.html#org.apache.spark.mllib.evaluation.BinaryClassificationMetrics) for details on the API.
+Refer to the [`LogisticRegressionWithLBFGS` Scala docs](api/scala/org/apache/spark/mllib/classification/LogisticRegressionWithLBFGS.html) and [`BinaryClassificationMetrics` Scala docs](api/scala/org/apache/spark/mllib/evaluation/BinaryClassificationMetrics.html) for details on the API.
 
 {% include_example scala/org/apache/spark/examples/mllib/BinaryClassificationMetricsExample.scala %}
 
@@ -130,11 +136,6 @@ Refer to the [`LogisticRegressionModel` Java docs](api/java/org/apache/spark/mll
 
 </div>
 
-<div data-lang="python" markdown="1">
-Refer to the [`BinaryClassificationMetrics` Python docs](api/python/pyspark.mllib.html#pyspark.mllib.evaluation.BinaryClassificationMetrics) and [`LogisticRegressionWithLBFGS` Python docs](api/python/pyspark.mllib.html#pyspark.mllib.classification.LogisticRegressionWithLBFGS) for more details on the API.
-
-{% include_example python/mllib/binary_classification_metrics_example.py %}
-</div>
 </div>
 
 
@@ -178,7 +179,7 @@ For this section, a modified delta function $\hat{\delta}(x)$ will prove useful
 
 $$\hat{\delta}(x) = \begin{cases}1 & \text{if $x = 0$}, \\ 0 & \text{otherwise}.\end{cases}$$
 
-<table class="table">
+<table>
   <thead>
     <tr><th>Metric</th><th>Definition</th></tr>
   </thead>
@@ -242,8 +243,15 @@ $$\hat{\delta}(x) = \begin{cases}1 & \text{if $x = 0$}, \\ 0 & \text{otherwise}.
 The following code snippets illustrate how to load a sample dataset, train a multiclass classification algorithm on
 the data, and evaluate the performance of the algorithm by several multiclass classification evaluation metrics.
 
+<div data-lang="python" markdown="1">
+Refer to the [`MulticlassMetrics` Python docs](api/python/reference/api/pyspark.mllib.evaluation.MulticlassMetrics.html) for more details on the API.
+
+{% include_example python/mllib/multi_class_metrics_example.py %}
+
+</div>
+
 <div data-lang="scala" markdown="1">
-Refer to the [`MulticlassMetrics` Scala docs](api/scala/index.html#org.apache.spark.mllib.evaluation.MulticlassMetrics) for details on the API.
+Refer to the [`MulticlassMetrics` Scala docs](api/scala/org/apache/spark/mllib/evaluation/MulticlassMetrics.html) for details on the API.
 
 {% include_example scala/org/apache/spark/examples/mllib/MulticlassMetricsExample.scala %}
 
@@ -256,12 +264,6 @@ Refer to the [`MulticlassMetrics` Java docs](api/java/org/apache/spark/mllib/eva
 
 </div>
 
-<div data-lang="python" markdown="1">
-Refer to the [`MulticlassMetrics` Python docs](api/python/pyspark.mllib.html#pyspark.mllib.evaluation.MulticlassMetrics) for more details on the API.
-
-{% include_example python/mllib/multi_class_metrics_example.py %}
-
-</div>
 </div>
 
 ### Multilabel classification
@@ -294,7 +296,7 @@ The following definition of indicator function $I_A(x)$ on a set $A$ will be nec
 
 $$I_A(x) = \begin{cases}1 & \text{if $x \in A$}, \\ 0 & \text{otherwise}.\end{cases}$$
 
-<table class="table">
+<table>
   <thead>
     <tr><th>Metric</th><th>Definition</th></tr>
   </thead>
@@ -392,8 +394,15 @@ True classes:
 
 <div class="codetabs">
 
+<div data-lang="python" markdown="1">
+Refer to the [`MultilabelMetrics` Python docs](api/python/reference/api/pyspark.mllib.evaluation.MultilabelMetrics.html) for more details on the API.
+
+{% include_example python/mllib/multi_label_metrics_example.py %}
+
+</div>
+
 <div data-lang="scala" markdown="1">
-Refer to the [`MultilabelMetrics` Scala docs](api/scala/index.html#org.apache.spark.mllib.evaluation.MultilabelMetrics) for details on the API.
+Refer to the [`MultilabelMetrics` Scala docs](api/scala/org/apache/spark/mllib/evaluation/MultilabelMetrics.html) for details on the API.
 
 {% include_example scala/org/apache/spark/examples/mllib/MultiLabelMetricsExample.scala %}
 
@@ -406,12 +415,6 @@ Refer to the [`MultilabelMetrics` Java docs](api/java/org/apache/spark/mllib/eva
 
 </div>
 
-<div data-lang="python" markdown="1">
-Refer to the [`MultilabelMetrics` Python docs](api/python/pyspark.mllib.html#pyspark.mllib.evaluation.MultilabelMetrics) for more details on the API.
-
-{% include_example python/mllib/multi_label_metrics_example.py %}
-
-</div>
 </div>
 
 ### Ranking systems
@@ -444,7 +447,7 @@ documents, returns a relevance score for the recommended document.
 
 $$rel_D(r) = \begin{cases}1 & \text{if $r \in D$}, \\ 0 & \text{otherwise}.\end{cases}$$
 
-<table class="table">
+<table>
   <thead>
     <tr><th>Metric</th><th>Definition</th><th>Notes</th></tr>
   </thead>
@@ -457,7 +460,7 @@ $$rel_D(r) = \begin{cases}1 & \text{if $r \in D$}, \\ 0 & \text{otherwise}.\end{
         $p(k)=\frac{1}{M} \sum_{i=0}^{M-1} {\frac{1}{k} \sum_{j=0}^{\text{min}(Q_i, k) - 1} rel_{D_i}(R_i(j))}$
       </td>
       <td>
-        <a href="https://en.wikipedia.org/wiki/Evaluation_measures_(information_retrieval)#Precision_at_K">Precision at k</a> is a measure of
+        <a href="https://en.wikipedia.org/wiki/Evaluation_measures_(information_retrieval)#Precision_at_k">Precision at k</a> is a measure of
          how many of the first k recommended documents are in the set of true relevant documents averaged across all
          users. In this metric, the order of the recommendations is not taken into account.
       </td>
@@ -520,8 +523,15 @@ expanded world of non-positive weights are "the same as never having interacted 
 
 <div class="codetabs">
 
+<div data-lang="python" markdown="1">
+Refer to the [`RegressionMetrics` Python docs](api/python/reference/api/pyspark.mllib.evaluation.RegressionMetrics.html) and [`RankingMetrics` Python docs](api/python/reference/api/pyspark.mllib.evaluation.RankingMetrics.html) for more details on the API.
+
+{% include_example python/mllib/ranking_metrics_example.py %}
+
+</div>
+
 <div data-lang="scala" markdown="1">
-Refer to the [`RegressionMetrics` Scala docs](api/scala/index.html#org.apache.spark.mllib.evaluation.RegressionMetrics) and [`RankingMetrics` Scala docs](api/scala/index.html#org.apache.spark.mllib.evaluation.RankingMetrics) for details on the API.
+Refer to the [`RegressionMetrics` Scala docs](api/scala/org/apache/spark/mllib/evaluation/RegressionMetrics.html) and [`RankingMetrics` Scala docs](api/scala/org/apache/spark/mllib/evaluation/RankingMetrics.html) for details on the API.
 
 {% include_example scala/org/apache/spark/examples/mllib/RankingMetricsExample.scala %}
 
@@ -534,12 +544,6 @@ Refer to the [`RegressionMetrics` Java docs](api/java/org/apache/spark/mllib/eva
 
 </div>
 
-<div data-lang="python" markdown="1">
-Refer to the [`RegressionMetrics` Python docs](api/python/pyspark.mllib.html#pyspark.mllib.evaluation.RegressionMetrics) and [`RankingMetrics` Python docs](api/python/pyspark.mllib.html#pyspark.mllib.evaluation.RankingMetrics) for more details on the API.
-
-{% include_example python/mllib/ranking_metrics_example.py %}
-
-</div>
 </div>
 
 ## Regression model evaluation
@@ -549,7 +553,7 @@ variable from a number of independent variables.
 
 **Available metrics**
 
-<table class="table">
+<table>
   <thead>
     <tr><th>Metric</th><th>Definition</th></tr>
   </thead>
@@ -577,31 +581,3 @@ variable from a number of independent variables.
     </tr>
   </tbody>
 </table>
-
-**Examples**
-
-<div class="codetabs">
-The following code snippets illustrate how to load a sample dataset, train a linear regression algorithm on the data,
-and evaluate the performance of the algorithm by several regression metrics.
-
-<div data-lang="scala" markdown="1">
-Refer to the [`RegressionMetrics` Scala docs](api/scala/index.html#org.apache.spark.mllib.evaluation.RegressionMetrics) for details on the API.
-
-{% include_example scala/org/apache/spark/examples/mllib/RegressionMetricsExample.scala %}
-
-</div>
-
-<div data-lang="java" markdown="1">
-Refer to the [`RegressionMetrics` Java docs](api/java/org/apache/spark/mllib/evaluation/RegressionMetrics.html) for details on the API.
-
-{% include_example java/org/apache/spark/examples/mllib/JavaRegressionMetricsExample.java %}
-
-</div>
-
-<div data-lang="python" markdown="1">
-Refer to the [`RegressionMetrics` Python docs](api/python/pyspark.mllib.html#pyspark.mllib.evaluation.RegressionMetrics) for more details on the API.
-
-{% include_example python/mllib/regression_metrics_example.py %}
-
-</div>
-</div>

@@ -24,7 +24,7 @@ import java.nio.charset.StandardCharsets._
 import scala.io.{Source => IOSource}
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.sources.v2.reader.streaming.{Offset => OffsetV2}
+import org.apache.spark.sql.connector.read.streaming.{Offset => OffsetV2}
 
 /**
  * This class is used to log offsets to persistent files in HDFS.
@@ -57,14 +57,15 @@ class OffsetSeqLog(sparkSession: SparkSession, path: String)
       throw new IllegalStateException("Incomplete log file")
     }
 
-    val version = parseVersion(lines.next(), OffsetSeqLog.VERSION)
+    validateVersion(lines.next(), OffsetSeqLog.VERSION)
 
     // read metadata
     val metadata = lines.next().trim match {
       case "" => None
       case md => Some(md)
     }
-    OffsetSeq.fill(metadata, lines.map(parseOffset).toArray: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    OffsetSeq.fill(metadata, lines.map(parseOffset).toArray.toImmutableArraySeq: _*)
   }
 
   override protected def serialize(offsetSeq: OffsetSeq, out: OutputStream): Unit = {
@@ -83,6 +84,10 @@ class OffsetSeqLog(sparkSession: SparkSession, path: String)
         case None => out.write(OffsetSeqLog.SERIALIZED_VOID_OFFSET.getBytes(UTF_8))
       }
     }
+  }
+
+  def offsetSeqMetadataForBatchId(batchId: Long): Option[OffsetSeqMetadata] = {
+    if (batchId < 0) None else get(batchId).flatMap(_.metadata)
   }
 }
 

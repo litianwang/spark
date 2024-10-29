@@ -19,18 +19,21 @@ package org.apache.spark.sql.execution.streaming.sources
 
 import java.util
 
-import scala.collection.JavaConverters._
+import scala.util.control.NonFatal
 
+import org.apache.spark.{SparkException, SparkThrowable}
 import org.apache.spark.sql.{ForeachWriter, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
+import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
+import org.apache.spark.sql.connector.catalog.{SupportsWrite, Table, TableCapability}
+import org.apache.spark.sql.connector.write.{DataWriter, LogicalWriteInfo, PhysicalWriteInfo, SupportsTruncate, Write, WriteBuilder, WriterCommitMessage}
+import org.apache.spark.sql.connector.write.streaming.{StreamingDataWriterFactory, StreamingWrite}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.python.PythonForeachWriter
-import org.apache.spark.sql.sources.v2.{SupportsWrite, Table, TableCapability}
-import org.apache.spark.sql.sources.v2.writer.{DataWriter, SupportsTruncate, WriteBuilder, WriterCommitMessage}
-import org.apache.spark.sql.sources.v2.writer.streaming.{StreamingDataWriterFactory, StreamingWrite}
+import org.apache.spark.sql.internal.connector.SupportsStreamingUpdateAsAppend
 import org.apache.spark.sql.types.StructType
-import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 /**
  * A write-only table for forwarding data into the specified [[ForeachWriter]].
@@ -50,40 +53,45 @@ case class ForeachWriterTable[T](
   override def schema(): StructType = StructType(Nil)
 
   override def capabilities(): util.Set[TableCapability] = {
-    Set(TableCapability.STREAMING_WRITE).asJava
+    util.EnumSet.of(TableCapability.STREAMING_WRITE)
   }
 
-  override def newWriteBuilder(options: CaseInsensitiveStringMap): WriteBuilder = {
-    new WriteBuilder with SupportsTruncate {
-      private var inputSchema: StructType = _
+  override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
+    new WriteBuilder with SupportsTruncate with SupportsStreamingUpdateAsAppend {
 
-      override def withInputDataSchema(schema: StructType): WriteBuilder = {
-        this.inputSchema = schema
-        this
-      }
-
-      // Do nothing for truncate. Foreach sink is special that it just forwards all the records to
-      // ForeachWriter.
+      // Do nothing for truncate. Foreach sink is special and it just forwards all the
+      // records to ForeachWriter.
       override def truncate(): WriteBuilder = this
 
-      override def buildForStreaming(): StreamingWrite = {
-        new StreamingWrite {
-          override def commit(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {}
-          override def abort(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {}
+      override def build(): Write = {
+        new ForeachWrite(info, writer, converter)
+      }
+    }
+  }
+}
 
-          override def createStreamingWriterFactory(): StreamingDataWriterFactory = {
-            val rowConverter: InternalRow => T = converter match {
-              case Left(enc) =>
-                val boundEnc = enc.resolveAndBind(
-                  inputSchema.toAttributes,
-                  SparkSession.getActiveSession.get.sessionState.analyzer)
-                boundEnc.fromRow
-              case Right(func) =>
-                func
-            }
-            ForeachWriterFactory(writer, rowConverter)
-          }
+class ForeachWrite[T](
+    info: LogicalWriteInfo,
+    writer: ForeachWriter[T],
+    converter: Either[ExpressionEncoder[T], InternalRow => T]) extends Write {
+  private val inputSchema: StructType = info.schema()
+  override def toStreaming: StreamingWrite = {
+    new StreamingWrite {
+      override def commit(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {}
+      override def abort(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {}
+
+      override def createStreamingWriterFactory(
+        info: PhysicalWriteInfo): StreamingDataWriterFactory = {
+        val rowConverter: InternalRow => T = converter match {
+          case Left(enc) =>
+            val boundEnc = enc.resolveAndBind(
+              toAttributes(inputSchema),
+              SparkSession.getActiveSession.get.sessionState.analyzer)
+            boundEnc.createDeserializer()
+          case Right(func) =>
+            func
         }
+        ForeachWriterFactory(writer, rowConverter)
       }
     }
   }
@@ -133,6 +141,7 @@ class ForeachDataWriter[T](
 
   // If open returns false, we should skip writing rows.
   private val opened = writer.open(partitionId, epochId)
+  private var errorOrNull: Throwable = _
 
   override def write(record: InternalRow): Unit = {
     if (!opened) return
@@ -140,21 +149,41 @@ class ForeachDataWriter[T](
     try {
       writer.process(rowConverter(record))
     } catch {
+      case NonFatal(e) if !e.isInstanceOf[SparkThrowable] =>
+        errorOrNull = e
+        throw ForeachUserFuncException(e)
       case t: Throwable =>
-        writer.close(t)
+        errorOrNull = t
         throw t
     }
+
   }
 
   override def commit(): WriterCommitMessage = {
-    writer.close(null)
     ForeachWriterCommitMessage
   }
 
-  override def abort(): Unit = {}
+  override def abort(): Unit = {
+    if (errorOrNull == null) {
+      errorOrNull = QueryExecutionErrors.foreachWriterAbortedDueToTaskFailureError()
+    }
+  }
+
+  override def close(): Unit = {
+    writer.close(errorOrNull)
+  }
 }
 
 /**
  * An empty [[WriterCommitMessage]]. [[ForeachWriter]] implementations have no global coordination.
  */
 case object ForeachWriterCommitMessage extends WriterCommitMessage
+
+/**
+ * Exception that wraps the exception thrown in the user provided function in Foreach sink.
+ */
+private[sql] case class ForeachUserFuncException(cause: Throwable)
+  extends SparkException(
+    errorClass = "FOREACH_USER_FUNCTION_ERROR",
+    messageParameters = Map("reason" -> Option(cause.getMessage).getOrElse("")),
+    cause = cause)

@@ -15,72 +15,129 @@
 # limitations under the License.
 #
 
-# Image for building Spark releases. Based on Ubuntu 18.04.
-#
-# Includes:
-# * Java 8
-# * Ivy
-# * Python/PyPandoc (2.7.15/3.6.7)
-# * R-base/R-base-dev (3.5.0+)
-# * Ruby 2.3 build utilities
+# Image for building Spark releases. Based on Ubuntu 22.04.
+FROM ubuntu:jammy-20240227
+LABEL org.opencontainers.image.authors="Apache Spark project <dev@spark.apache.org>"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.ref.name="Apache Spark Release Manager Image"
+# Overwrite this label to avoid exposing the underlying Ubuntu OS version label
+LABEL org.opencontainers.image.version=""
 
-FROM ubuntu:18.04
+ENV FULL_REFRESH_DATE 20240318
 
-# For apt to be noninteractive
 ENV DEBIAN_FRONTEND noninteractive
 ENV DEBCONF_NONINTERACTIVE_SEEN true
 
-# These arguments are just for reuse and not really meant to be customized.
-ARG APT_INSTALL="apt-get install --no-install-recommends -y"
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    ca-certificates \
+    curl \
+    gfortran \
+    git \
+    subversion \
+    gnupg \
+    libcurl4-openssl-dev \
+    libfontconfig1-dev \
+    libfreetype6-dev \
+    libfribidi-dev \
+    libgit2-dev \
+    libharfbuzz-dev \
+    libjpeg-dev \
+    liblapack-dev \
+    libopenblas-dev \
+    libpng-dev \
+    libpython3-dev \
+    libssl-dev \
+    libtiff5-dev \
+    libxml2-dev \
+    nodejs \
+    npm \
+    openjdk-17-jdk-headless \
+    pandoc \
+    pkg-config \
+    python3.10 \
+    python3-psutil \
+    texlive-latex-base \
+    texlive \
+    texlive-fonts-extra \
+    texinfo \
+    texlive-latex-extra \
+    qpdf \
+    jq \
+    r-base \
+    ruby \
+    ruby-dev \
+    software-properties-common \
+    wget \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-ARG BASE_PIP_PKGS="setuptools wheel virtualenv"
-ARG PIP_PKGS="pyopenssl pypandoc numpy pygments sphinx"
 
-# Install extra needed repos and refresh.
-# - CRAN repo
-# - Ruby repo (for doc generation)
-#
-# This is all in a single "RUN" command so that if anything changes, "apt update" is run to fetch
-# the most current package versions (instead of potentially using old versions cached by docker).
-RUN apt-get clean && apt-get update && $APT_INSTALL gnupg ca-certificates && \
-  echo 'deb https://cloud.r-project.org/bin/linux/ubuntu bionic-cran35/' >> /etc/apt/sources.list && \
-  gpg --keyserver keyserver.ubuntu.com --recv-key E084DAB9 && \
-  gpg -a --export E084DAB9 | apt-key add - && \
-  apt-get clean && \
-  rm -rf /var/lib/apt/lists/* && \
-  apt-get clean && \
-  apt-get update && \
-  $APT_INSTALL software-properties-common && \
-  apt-add-repository -y ppa:brightbox/ruby-ng && \
-  apt-get update && \
-  # Install openjdk 8.
-  $APT_INSTALL openjdk-8-jdk && \
-  update-alternatives --set java /usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java && \
-  # Install build / source control tools
-  $APT_INSTALL curl wget git maven ivy subversion make gcc lsof libffi-dev \
-    pandoc pandoc-citeproc libssl-dev libcurl4-openssl-dev libxml2-dev && \
-  curl -sL https://deb.nodesource.com/setup_11.x | bash && \
-  $APT_INSTALL nodejs && \
-  # Install needed python packages. Use pip for installing packages (for consistency).
-  $APT_INSTALL libpython2.7-dev libpython3-dev python-pip python3-pip && \
-  pip install $BASE_PIP_PKGS && \
-  pip install $PIP_PKGS && \
-  cd && \
-  virtualenv -p python3 /opt/p35 && \
-  . /opt/p35/bin/activate && \
-  pip install $BASE_PIP_PKGS && \
-  pip install $PIP_PKGS && \
-  # Install R packages and dependencies used when building.
-  # R depends on pandoc*, libssl (which are installed above).
-  $APT_INSTALL r-base r-base-dev && \
-  $APT_INSTALL texlive-latex-base texlive texlive-fonts-extra texinfo qpdf && \
-  Rscript -e "install.packages(c('curl', 'xml2', 'httr', 'devtools', 'testthat', 'knitr', 'rmarkdown', 'roxygen2', 'e1071', 'survival'), repos='https://cloud.r-project.org/')" && \
-  Rscript -e "devtools::install_github('jimhester/lintr')" && \
-  # Install tools needed to build the documentation.
-  $APT_INSTALL ruby2.3 ruby2.3-dev mkdocs && \
-  gem install jekyll --no-rdoc --no-ri && \
-  gem install jekyll-redirect-from && \
-  gem install pygments.rb
+RUN echo 'deb https://cloud.r-project.org/bin/linux/ubuntu jammy-cran40/' >> /etc/apt/sources.list
+RUN gpg --keyserver hkps://keyserver.ubuntu.com --recv-key E298A3A825C0D65DFD57CBB651716619E084DAB9
+RUN gpg -a --export E084DAB9 | apt-key add -
+RUN add-apt-repository 'deb https://cloud.r-project.org/bin/linux/ubuntu jammy-cran40/'
+
+# See more in SPARK-39959, roxygen2 < 7.2.1
+RUN Rscript -e "install.packages(c('devtools', 'knitr', 'markdown',  \
+    'rmarkdown', 'testthat', 'devtools', 'e1071', 'survival', 'arrow',  \
+    'ggplot2', 'mvtnorm', 'statmod', 'xml2'), repos='https://cloud.r-project.org/')" && \
+    Rscript -e "devtools::install_version('roxygen2', version='7.2.0', repos='https://cloud.r-project.org')" && \
+    Rscript -e "devtools::install_version('lintr', version='2.0.1', repos='https://cloud.r-project.org')" && \
+    Rscript -e "devtools::install_version('pkgdown', version='2.0.1', repos='https://cloud.r-project.org')" && \
+    Rscript -e "devtools::install_version('preferably', version='0.4', repos='https://cloud.r-project.org')"
+
+# See more in SPARK-39735
+ENV R_LIBS_SITE "/usr/local/lib/R/site-library:${R_LIBS_SITE}:/usr/lib/R/library"
+
+
+RUN add-apt-repository ppa:pypy/ppa
+RUN mkdir -p /usr/local/pypy/pypy3.10 && \
+    curl -sqL https://downloads.python.org/pypy/pypy3.10-v7.3.17-linux64.tar.bz2 | tar xjf - -C /usr/local/pypy/pypy3.10 --strip-components=1 && \
+    ln -sf /usr/local/pypy/pypy3.10/bin/pypy /usr/local/bin/pypy3.10 && \
+    ln -sf /usr/local/pypy/pypy3.10/bin/pypy /usr/local/bin/pypy3
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | pypy3
+RUN pypy3 -m pip install numpy 'six==1.16.0' 'pandas==2.2.2' scipy coverage matplotlib lxml
+
+
+ARG BASIC_PIP_PKGS="numpy pyarrow>=15.0.0 six==1.16.0 pandas==2.2.2 scipy plotly>=4.8 mlflow>=2.8.1 coverage matplotlib openpyxl memory-profiler>=0.61.0 scikit-learn>=1.3.2 twine==3.4.1"
+# Python deps for Spark Connect
+ARG CONNECT_PIP_PKGS="grpcio==1.67.0 grpcio-status==1.67.0 protobuf==5.28.3 googleapis-common-protos==1.65.0"
+
+# Install Python 3.10 packages
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
+RUN python3.10 -m pip install --ignore-installed blinker>=1.6.2 # mlflow needs this
+RUN python3.10 -m pip install --ignore-installed 'six==1.16.0'  # Avoid `python3-six` installation
+RUN python3.10 -m pip install $BASIC_PIP_PKGS unittest-xml-reporting $CONNECT_PIP_PKGS && \
+    python3.10 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
+    python3.10 -m pip install deepspeed torcheval && \
+    python3.10 -m pip cache purge
+
+# Install Python 3.9
+RUN add-apt-repository ppa:deadsnakes/ppa
+RUN apt-get update && apt-get install -y \
+    python3.9 python3.9-distutils \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.9
+RUN python3.9 -m pip install --ignore-installed blinker>=1.6.2 # mlflow needs this
+RUN python3.9 -m pip install --force $BASIC_PIP_PKGS unittest-xml-reporting $CONNECT_PIP_PKGS && \
+    python3.9 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
+    python3.9 -m pip install torcheval && \
+    python3.9 -m pip cache purge
+
+# Should unpin 'sphinxcontrib-*' after upgrading sphinx>5
+# See 'ipython_genutils' in SPARK-38517
+# See 'docutils<0.18.0' in SPARK-39421
+RUN python3.9 -m pip install 'sphinx==4.5.0' mkdocs 'pydata_sphinx_theme>=0.13' sphinx-copybutton nbsphinx numpydoc jinja2 markupsafe 'pyzmq<24.0.0' \
+ipython ipython_genutils sphinx_plotly_directive 'numpy>=1.20.0' pyarrow pandas 'plotly>=4.8' 'docutils<0.18.0' \
+'flake8==3.9.0' 'mypy==1.8.0' 'pytest==7.1.3' 'pytest-mypy-plugins==1.9.3' 'black==23.9.1' \
+'pandas-stubs==1.2.0.53' 'grpcio==1.67.0' 'grpc-stubs==1.24.11' 'googleapis-common-protos-stubs==2.2.0' \
+'sphinxcontrib-applehelp==1.0.4' 'sphinxcontrib-devhelp==1.0.2' 'sphinxcontrib-htmlhelp==2.0.1' 'sphinxcontrib-qthelp==1.0.3' 'sphinxcontrib-serializinghtml==1.1.5'
+RUN python3.9 -m pip list
+
+RUN gem install --no-document "bundler:2.4.22"
+RUN ln -s "$(which python3.9)" "/usr/local/bin/python"
+RUN ln -s "$(which python3.9)" "/usr/local/bin/python3"
 
 WORKDIR /opt/spark-rm/output
 

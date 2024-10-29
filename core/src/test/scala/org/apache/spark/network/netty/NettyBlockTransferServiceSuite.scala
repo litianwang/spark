@@ -24,14 +24,17 @@ import scala.reflect.ClassTag
 import scala.util.Random
 
 import org.mockito.ArgumentMatchers.any
-import org.mockito.Mockito.{mock, times, verify, when}
-import org.scalatest._
+import org.mockito.Mockito.{mock, when}
+import org.scalatest.BeforeAndAfterEach
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
 
 import org.apache.spark.{ExecutorDeadException, SecurityManager, SparkConf, SparkFunSuite}
 import org.apache.spark.network.BlockDataManager
 import org.apache.spark.network.client.{TransportClient, TransportClientFactory}
 import org.apache.spark.network.shuffle.{BlockFetchingListener, DownloadFileManager}
 import org.apache.spark.rpc.{RpcAddress, RpcEndpointRef, RpcTimeout}
+import org.apache.spark.serializer.{JavaSerializer, SerializerManager}
 
 class NettyBlockTransferServiceSuite
   extends SparkFunSuite
@@ -41,7 +44,7 @@ class NettyBlockTransferServiceSuite
   private var service0: NettyBlockTransferService = _
   private var service1: NettyBlockTransferService = _
 
-  override def afterEach() {
+  override def afterEach(): Unit = {
     try {
       if (service0 != null) {
         service0.close()
@@ -86,7 +89,7 @@ class NettyBlockTransferServiceSuite
   }
 
   test("SPARK-27637: test fetch block with executor dead") {
-    implicit val exectionContext = ExecutionContext.global
+    implicit val executionContext = ExecutionContext.global
     val port = 17634 + Random.nextInt(10000)
     logInfo("random port for test: " + port)
 
@@ -105,19 +108,19 @@ class NettyBlockTransferServiceSuite
     // This is used to touch an IOException during fetching block.
     when(client.sendRpc(any(), any())).thenAnswer(_ => {throw new IOException()})
     var createClientCount = 0
-    when(clientFactory.createClient(any(), any())).thenAnswer(_ => {
+    when(clientFactory.createClient(any(), any(), any())).thenAnswer(_ => {
       createClientCount += 1
       client
     })
 
     val listener = mock(classOf[BlockFetchingListener])
     var hitExecutorDeadException = false
-    when(listener.onBlockFetchFailure(any(), any(classOf[ExecutorDeadException])))
+    when(listener.onBlockTransferFailure(any(), any(classOf[ExecutorDeadException])))
       .thenAnswer(_ => {hitExecutorDeadException = true})
 
     service0 = createService(port, driverEndpointRef)
-    val clientFactoryField = service0.getClass.getField(
-      "org$apache$spark$network$netty$NettyBlockTransferService$$clientFactory")
+    val clientFactoryField = service0.getClass
+      .getSuperclass.getSuperclass.getDeclaredField("clientFactory")
     clientFactoryField.setAccessible(true)
     clientFactoryField.set(service0, clientFactory)
 
@@ -140,10 +143,11 @@ class NettyBlockTransferServiceSuite
       rpcEndpointRef: RpcEndpointRef = null): NettyBlockTransferService = {
     val conf = new SparkConf()
       .set("spark.app.id", s"test-${getClass.getName}")
+    val serializerManager = new SerializerManager(new JavaSerializer(conf), conf)
     val securityManager = new SecurityManager(conf)
     val blockDataManager = mock(classOf[BlockDataManager])
-    val service = new NettyBlockTransferService(conf, securityManager, "localhost", "localhost",
-      port, 1, rpcEndpointRef)
+    val service = new NettyBlockTransferService(
+      conf, securityManager, serializerManager, "localhost", "localhost", port, 1, rpcEndpointRef)
     service.init(blockDataManager)
     service
   }

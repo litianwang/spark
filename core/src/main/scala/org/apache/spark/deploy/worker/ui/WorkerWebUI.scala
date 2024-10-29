@@ -18,7 +18,8 @@
 package org.apache.spark.deploy.worker.ui
 
 import java.io.File
-import javax.servlet.http.HttpServletRequest
+
+import jakarta.servlet.http.HttpServletRequest
 
 import org.apache.spark.deploy.worker.Worker
 import org.apache.spark.internal.Logging
@@ -43,7 +44,7 @@ class WorkerWebUI(
   initialize()
 
   /** Initialize all components of the server. */
-  def initialize() {
+  def initialize(): Unit = {
     val logPage = new LogPage(this)
     attachPage(logPage)
     attachPage(new WorkerPage(this))

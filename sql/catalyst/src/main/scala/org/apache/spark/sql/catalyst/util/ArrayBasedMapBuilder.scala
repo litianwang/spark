@@ -19,7 +19,11 @@ package org.apache.spark.sql.catalyst.util
 
 import scala.collection.mutable
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.optimizer.NormalizeFloatingNumbers
+import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.array.ByteArrayMethods
 
@@ -29,16 +33,23 @@ import org.apache.spark.unsafe.array.ByteArrayMethods
  */
 class ArrayBasedMapBuilder(keyType: DataType, valueType: DataType) extends Serializable {
   assert(!keyType.existsRecursively(_.isInstanceOf[MapType]), "key of map cannot be/contain map")
-  assert(keyType != NullType, "map key cannot be null type.")
 
-  private lazy val keyToIndex = keyType match {
-    // Binary type data is `byte[]`, which can't use `==` to check equality.
-    case _: AtomicType | _: CalendarIntervalType if !keyType.isInstanceOf[BinaryType] =>
-      new java.util.HashMap[Any, Int]()
-    case _ =>
-      // for complex types, use interpreted ordering to be able to compare unsafe data with safe
-      // data, e.g. UnsafeRow vs GenericInternalRow.
-      new java.util.TreeMap[Any, Int](TypeUtils.getInterpretedOrdering(keyType))
+  private lazy val keyToIndex = {
+    def hashMap = new java.util.HashMap[Any, Int]()
+    def treeMap = new java.util.TreeMap[Any, Int](TypeUtils.getInterpretedOrdering(keyType))
+
+    keyType match {
+      // StringType binary equality support implies hashing support
+      case s: StringType if s.supportsBinaryEquality => hashMap
+      case _: StringType => treeMap
+      // Binary type data is `byte[]`, which can't use `==` to check equality.
+      case _: BinaryType => treeMap
+      case _: AtomicType | _: CalendarIntervalType | _: NullType => hashMap
+      case _ =>
+        // for complex types, use interpreted ordering to be able to compare unsafe data with safe
+        // data, e.g. UnsafeRow vs GenericInternalRow.
+        treeMap
+    }
   }
 
   // TODO: specialize it
@@ -48,38 +59,53 @@ class ArrayBasedMapBuilder(keyType: DataType, valueType: DataType) extends Seria
   private lazy val keyGetter = InternalRow.getAccessor(keyType)
   private lazy val valueGetter = InternalRow.getAccessor(valueType)
 
-  def put(key: Any, value: Any): Unit = {
-    if (key == null) {
-      throw new RuntimeException("Cannot use null as map key.")
+  private val mapKeyDedupPolicy = SQLConf.get.getConf(SQLConf.MAP_KEY_DEDUP_POLICY)
+
+  private lazy val keyNormalizer: Any => Any =
+    (SQLConf.get.getConf(SQLConf.DISABLE_MAP_KEY_NORMALIZATION), keyType) match {
+      case (false, FloatType) => NormalizeFloatingNumbers.FLOAT_NORMALIZER
+      case (false, DoubleType) => NormalizeFloatingNumbers.DOUBLE_NORMALIZER
+      case _ => identity
     }
 
-    val index = keyToIndex.getOrDefault(key, -1)
+
+  def put(key: Any, value: Any): Unit = {
+    if (key == null) {
+      throw QueryExecutionErrors.nullAsMapKeyNotAllowedError()
+    }
+
+    val keyNormalized = keyNormalizer(key)
+    val index = keyToIndex.getOrDefault(keyNormalized, -1)
     if (index == -1) {
       if (size >= ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH) {
-        throw new RuntimeException(s"Unsuccessful attempt to build maps with $size elements " +
-          s"due to exceeding the map size limit ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH}.")
+        throw QueryExecutionErrors.exceedMapSizeLimitError(size)
       }
-      keyToIndex.put(key, values.length)
-      keys.append(key)
+      keyToIndex.put(keyNormalized, values.length)
+      keys.append(keyNormalized)
       values.append(value)
     } else {
-      // Overwrite the previous value, as the policy is last wins.
-      values(index) = value
+      if (mapKeyDedupPolicy == SQLConf.MapKeyDedupPolicy.EXCEPTION.toString) {
+        throw QueryExecutionErrors.duplicateMapKeyFoundError(key)
+      } else if (mapKeyDedupPolicy == SQLConf.MapKeyDedupPolicy.LAST_WIN.toString) {
+        // Overwrite the previous value, as the policy is last wins.
+        values(index) = value
+      } else {
+        throw SparkException.internalError("Unknown map key dedup policy: " + mapKeyDedupPolicy)
+      }
     }
   }
 
   // write a 2-field row, the first field is key and the second field is value.
   def put(entry: InternalRow): Unit = {
     if (entry.isNullAt(0)) {
-      throw new RuntimeException("Cannot use null as map key.")
+      throw QueryExecutionErrors.nullAsMapKeyNotAllowedError()
     }
     put(keyGetter(entry, 0), valueGetter(entry, 1))
   }
 
   def putAll(keyArray: ArrayData, valueArray: ArrayData): Unit = {
     if (keyArray.numElements() != valueArray.numElements()) {
-      throw new RuntimeException(
-        "The key array and value array of MapData must have the same length.")
+      throw QueryExecutionErrors.mapDataKeyArrayLengthDiffersFromValueArrayLengthError()
     }
 
     var i = 0

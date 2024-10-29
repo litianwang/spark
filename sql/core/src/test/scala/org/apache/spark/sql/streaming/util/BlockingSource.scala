@@ -49,10 +49,10 @@ class BlockingSource extends StreamSourceProvider with StreamSinkProvider {
       override def schema: StructType = fakeSchema
       override def getOffset: Option[Offset] = Some(new LongOffset(0))
       override def getBatch(start: Option[Offset], end: Offset): DataFrame = {
-        import spark.implicits._
+        import spark.sparkSession.implicits._
         Seq[Int]().toDS().toDF()
       }
-      override def stop() {}
+      override def stop(): Unit = {}
     }
   }
 

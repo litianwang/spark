@@ -82,7 +82,7 @@ class ApplicationMasterArguments(val args: Array[String]) {
     userArgs = userArgsBuffer.toList
   }
 
-  def printUsageAndExit(exitCode: Int, unknownParam: Any = null) {
+  def printUsageAndExit(exitCode: Int, unknownParam: Any = null): Unit = {
     // scalastyle:off println
     if (unknownParam != null) {
       System.err.println("Unknown/unsupported param " + unknownParam)
@@ -101,8 +101,4 @@ class ApplicationMasterArguments(val args: Array[String]) {
     // scalastyle:on println
     System.exit(exitCode)
   }
-}
-
-object ApplicationMasterArguments {
-  val DEFAULT_NUMBER_EXECUTORS = 2
 }

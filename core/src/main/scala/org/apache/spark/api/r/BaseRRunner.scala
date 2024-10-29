@@ -82,12 +82,7 @@ private[spark] abstract class BaseRRunner[IN, OUT](
       serverSocket.close()
     }
 
-    try {
-      newReaderIterator(dataStream, errThread)
-    } catch {
-      case e: Exception =>
-        throw new SparkException("R computation failed with\n " + errThread.getLines(), e)
-    }
+    newReaderIterator(dataStream, errThread)
   }
 
   /**
@@ -138,6 +133,16 @@ private[spark] abstract class BaseRRunner[IN, OUT](
      * and then returns null.
      */
     protected def read(): OUT
+
+    protected val handleException: PartialFunction[Throwable, OUT] = {
+      case e: Exception =>
+        var msg = "R unexpectedly exited."
+        val lines = errThread.getLines()
+        if (lines.trim().nonEmpty) {
+          msg += s"\nR worker produced errors: $lines\n"
+        }
+        throw new SparkException(msg, e)
+    }
   }
 
   /**
@@ -230,8 +235,8 @@ private[spark] class BufferedStreamThread(
     errBufferSize: Int) extends Thread(name) with Logging {
   val lines = new Array[String](errBufferSize)
   var lineIdx = 0
-  override def run() {
-    for (line <- Source.fromInputStream(in).getLines) {
+  override def run(): Unit = {
+    for (line <- Source.fromInputStream(in).getLines()) {
       synchronized {
         lines(lineIdx) = line
         lineIdx = (lineIdx + 1) % errBufferSize
@@ -273,6 +278,16 @@ private[r] object BaseRRunner {
     thread
   }
 
+  private[r] def getROptions(rCommand: String): String = Try {
+    val result = scala.sys.process.Process(Seq(rCommand, "--version")).!!
+    "([0-9]+)\\.([0-9]+)\\.([0-9]+)".r.findFirstMatchIn(result).map { m =>
+      val major = m.group(1).toInt
+      val minor = m.group(2).toInt
+      val shouldUseNoRestore = major > 4 || major == 4 && minor >= 2
+      if (shouldUseNoRestore) "--no-restore" else "--vanilla"
+    }.getOrElse("--vanilla")
+  }.getOrElse("--vanilla")
+
   private def createRProcess(port: Int, script: String): BufferedStreamThread = {
     // "spark.sparkr.r.command" is deprecated and replaced by "spark.r.command",
     // but kept here for backward compatibility.
@@ -281,7 +296,7 @@ private[r] object BaseRRunner {
     rCommand = sparkConf.get(R_COMMAND).orElse(Some(rCommand)).get
 
     val rConnectionTimeout = sparkConf.get(R_BACKEND_CONNECTION_TIMEOUT)
-    val rOptions = "--vanilla"
+    val rOptions = getROptions(rCommand)
     val rLibDir = RUtils.sparkRPackagePath(isDriver = false)
     val rExecScript = rLibDir(0) + "/SparkR/worker/" + script
     val pb = new ProcessBuilder(Arrays.asList(rCommand, rOptions, rExecScript))

@@ -19,6 +19,7 @@ package org.apache.spark.memory;
 
 import java.io.IOException;
 
+import org.apache.spark.errors.SparkCoreErrors;
 import org.apache.spark.unsafe.array.LongArray;
 import org.apache.spark.unsafe.memory.MemoryBlock;
 
@@ -40,8 +41,8 @@ public abstract class MemoryConsumer {
     this.mode = mode;
   }
 
-  protected MemoryConsumer(TaskMemoryManager taskMemoryManager) {
-    this(taskMemoryManager, taskMemoryManager.pageSizeBytes(), MemoryMode.ON_HEAP);
+  protected MemoryConsumer(TaskMemoryManager taskMemoryManager, MemoryMode mode) {
+    this(taskMemoryManager, taskMemoryManager.pageSizeBytes(), mode);
   }
 
   /**
@@ -54,7 +55,7 @@ public abstract class MemoryConsumer {
   /**
    * Returns the size of used memory in bytes.
    */
-  protected long getUsed() {
+  public long getUsed() {
     return used;
   }
 
@@ -78,7 +79,6 @@ public abstract class MemoryConsumer {
    * @param size the amount of memory should be released
    * @param trigger the MemoryConsumer that trigger this spilling
    * @return the amount of released memory in bytes
-   * @throws IOException
    */
   public abstract long spill(long size, MemoryConsumer trigger) throws IOException;
 
@@ -154,9 +154,6 @@ public abstract class MemoryConsumer {
       taskMemoryManager.freePage(page, this);
     }
     taskMemoryManager.showMemoryUsage();
-    // checkstyle.off: RegexpSinglelineJava
-    throw new SparkOutOfMemoryError("Unable to acquire " + required + " bytes of memory, got " +
-      got);
-    // checkstyle.on: RegexpSinglelineJava
+    throw SparkCoreErrors.outOfMemoryError(required, got);
   }
 }

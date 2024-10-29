@@ -18,12 +18,13 @@ package org.apache.spark.sql.execution.datasources.v2
 
 import org.apache.hadoop.mapreduce.Job
 
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, LogKeys, MDC}
 import org.apache.spark.internal.io.FileCommitProtocol
+import org.apache.spark.sql.connector.write.{BatchWrite, DataWriterFactory, PhysicalWriteInfo, WriterCommitMessage}
 import org.apache.spark.sql.execution.datasources.{WriteJobDescription, WriteTaskResult}
 import org.apache.spark.sql.execution.datasources.FileFormatWriter.processStats
-import org.apache.spark.sql.sources.v2.writer._
-import org.apache.spark.util.SerializableConfiguration
+import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.Utils
 
 class FileBatchWrite(
     job: Job,
@@ -32,11 +33,15 @@ class FileBatchWrite(
   extends BatchWrite with Logging {
   override def commit(messages: Array[WriterCommitMessage]): Unit = {
     val results = messages.map(_.asInstanceOf[WriteTaskResult])
-    committer.commitJob(job, results.map(_.commitMsg))
-    logInfo(s"Write Job ${description.uuid} committed.")
+    logInfo(log"Start to commit write Job ${MDC(LogKeys.UUID, description.uuid)}.")
+    val (_, duration) = Utils
+      .timeTakenMs { committer.commitJob(job, results.map(_.commitMsg).toImmutableArraySeq) }
+    logInfo(log"Write Job ${MDC(LogKeys.UUID, description.uuid)} committed. " +
+      log"Elapsed time: ${MDC(LogKeys.ELAPSED_TIME, duration)} ms.")
 
-    processStats(description.statsTrackers, results.map(_.summary.stats))
-    logInfo(s"Finished processing stats for write job ${description.uuid}.")
+    processStats(
+      description.statsTrackers, results.map(_.summary.stats).toImmutableArraySeq, duration)
+    logInfo(log"Finished processing stats for write job ${MDC(LogKeys.UUID, description.uuid)}.")
   }
 
   override def useCommitCoordinator(): Boolean = false
@@ -45,7 +50,7 @@ class FileBatchWrite(
     committer.abortJob(job)
   }
 
-  override def createBatchWriterFactory(): DataWriterFactory = {
+  override def createBatchWriterFactory(info: PhysicalWriteInfo): DataWriterFactory = {
     FileWriterFactory(description, committer)
   }
 }

@@ -23,24 +23,33 @@ import java.util.function.Supplier
 
 import scala.concurrent.duration._
 
+import org.json4s.{DefaultFormats, Extraction, Formats}
 import org.mockito.{Mock, MockitoAnnotations}
 import org.mockito.Answers.RETURNS_SMART_NULLS
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito._
 import org.mockito.invocation.InvocationOnMock
-import org.scalatest.{BeforeAndAfter, Matchers}
+import org.scalatest.{BeforeAndAfter, PrivateMethodTester}
 import org.scalatest.concurrent.Eventually.{eventually, interval, timeout}
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite}
+import org.apache.spark.TestUtils.{createTempJsonFile, createTempScriptWithExpectedOutput}
 import org.apache.spark.deploy.{Command, ExecutorState, ExternalShuffleService}
 import org.apache.spark.deploy.DeployMessages.{DriverStateChanged, ExecutorStateChanged, WorkDirCleanup}
 import org.apache.spark.deploy.master.DriverState
 import org.apache.spark.internal.config
+import org.apache.spark.internal.config.SHUFFLE_SERVICE_DB_BACKEND
 import org.apache.spark.internal.config.Worker._
+import org.apache.spark.network.shuffledb.DBBackend
+import org.apache.spark.resource.{ResourceAllocation, ResourceInformation}
+import org.apache.spark.resource.ResourceUtils._
+import org.apache.spark.resource.TestResourceIDs.{WORKER_FPGA_ID, WORKER_GPU_ID}
 import org.apache.spark.rpc.{RpcAddress, RpcEnv}
 import org.apache.spark.util.Utils
 
-class WorkerSuite extends SparkFunSuite with Matchers with BeforeAndAfter {
+class WorkerSuite extends SparkFunSuite with Matchers with BeforeAndAfter with PrivateMethodTester {
 
   import org.apache.spark.deploy.DeployTestUtils._
 
@@ -51,21 +60,34 @@ class WorkerSuite extends SparkFunSuite with Matchers with BeforeAndAfter {
   }
   def conf(opts: (String, String)*): SparkConf = new SparkConf(loadDefaults = false).setAll(opts)
 
+  implicit val formats: Formats = DefaultFormats
+
+  private val _generateWorkerId = PrivateMethod[String](Symbol("generateWorkerId"))
+
   private var _worker: Worker = _
 
   private def makeWorker(
-      conf: SparkConf,
-      shuffleServiceSupplier: Supplier[ExternalShuffleService] = null): Worker = {
+      conf: SparkConf = new SparkConf(),
+      shuffleServiceSupplier: Supplier[ExternalShuffleService] = null,
+      local: Boolean = false): Worker = {
     assert(_worker === null, "Some Worker's RpcEnv is leaked in tests")
     val securityMgr = new SecurityManager(conf)
     val rpcEnv = RpcEnv.create("test", "localhost", 12345, conf, securityMgr)
-    _worker = new Worker(rpcEnv, 50000, 20, 1234 * 5, Array.fill(1)(RpcAddress("1.2.3.4", 1234)),
-      "Worker", "/tmp", conf, securityMgr, shuffleServiceSupplier)
-    _worker
+    val resourcesFile = conf.get(SPARK_WORKER_RESOURCE_FILE)
+    val workDir = Utils.createTempDir(namePrefix = this.getClass.getSimpleName).toString
+    val localWorker = new Worker(rpcEnv, 50000, 20, 1234 * 5,
+      Array.fill(1)(RpcAddress("1.2.3.4", 1234)), "Worker", workDir,
+      conf, securityMgr, resourcesFile, shuffleServiceSupplier)
+    if (local) {
+      localWorker
+    } else {
+      _worker = localWorker
+      _worker
+    }
   }
 
   before {
-    MockitoAnnotations.initMocks(this)
+    MockitoAnnotations.openMocks(this).close()
   }
 
   after {
@@ -218,6 +240,79 @@ class WorkerSuite extends SparkFunSuite with Matchers with BeforeAndAfter {
     }
   }
 
+  test("worker could be launched without any resources") {
+    val worker = makeWorker()
+    worker.rpcEnv.setupEndpoint("worker", worker)
+    eventually(timeout(10.seconds)) {
+      assert(worker.resources === Map.empty)
+      worker.rpcEnv.shutdown()
+      worker.rpcEnv.awaitTermination()
+    }
+  }
+
+  test("worker could load resources from resources file while launching") {
+    val conf = new SparkConf()
+    withTempDir { dir =>
+      val gpuArgs = ResourceAllocation(WORKER_GPU_ID, Seq("0", "1"))
+      val fpgaArgs =
+        ResourceAllocation(WORKER_FPGA_ID, Seq("f1", "f2", "f3"))
+      val ja = Extraction.decompose(Seq(gpuArgs, fpgaArgs))
+      val f1 = createTempJsonFile(dir, "resources", ja)
+      conf.set(SPARK_WORKER_RESOURCE_FILE.key, f1)
+      conf.set(WORKER_GPU_ID.amountConf, "2")
+      conf.set(WORKER_FPGA_ID.amountConf, "3")
+      val worker = makeWorker(conf)
+      worker.rpcEnv.setupEndpoint("worker", worker)
+      eventually(timeout(10.seconds)) {
+        assert(worker.resources === Map(GPU -> gpuArgs.toResourceInformation,
+          FPGA -> fpgaArgs.toResourceInformation))
+        worker.rpcEnv.shutdown()
+        worker.rpcEnv.awaitTermination()
+      }
+    }
+  }
+
+  test("worker could load resources from discovery script while launching") {
+    val conf = new SparkConf()
+    withTempDir { dir =>
+      val scriptPath = createTempScriptWithExpectedOutput(dir, "fpgaDiscoverScript",
+        """{"name": "fpga","addresses":["f1", "f2", "f3"]}""")
+      conf.set(WORKER_FPGA_ID.discoveryScriptConf, scriptPath)
+      conf.set(WORKER_FPGA_ID.amountConf, "3")
+      val worker = makeWorker(conf)
+      worker.rpcEnv.setupEndpoint("worker", worker)
+      eventually(timeout(10.seconds)) {
+        assert(worker.resources === Map(FPGA ->
+          new ResourceInformation(FPGA, Array("f1", "f2", "f3"))))
+        worker.rpcEnv.shutdown()
+        worker.rpcEnv.awaitTermination()
+      }
+    }
+  }
+
+  test("worker could load resources from resources file and discovery script while launching") {
+    val conf = new SparkConf()
+    withTempDir { dir =>
+      val gpuArgs = ResourceAllocation(WORKER_GPU_ID, Seq("0", "1"))
+      val ja = Extraction.decompose(Seq(gpuArgs))
+      val resourcesPath = createTempJsonFile(dir, "resources", ja)
+      val scriptPath = createTempScriptWithExpectedOutput(dir, "fpgaDiscoverScript",
+        """{"name": "fpga","addresses":["f1", "f2", "f3"]}""")
+      conf.set(SPARK_WORKER_RESOURCE_FILE.key, resourcesPath)
+      conf.set(WORKER_FPGA_ID.discoveryScriptConf, scriptPath)
+      conf.set(WORKER_FPGA_ID.amountConf, "3")
+      conf.set(WORKER_GPU_ID.amountConf, "2")
+      val worker = makeWorker(conf)
+      worker.rpcEnv.setupEndpoint("worker", worker)
+      eventually(timeout(10.seconds)) {
+        assert(worker.resources === Map(GPU -> gpuArgs.toResourceInformation,
+          FPGA -> new ResourceInformation(FPGA, Array("f1", "f2", "f3"))))
+        worker.rpcEnv.shutdown()
+        worker.rpcEnv.awaitTermination()
+      }
+    }
+  }
+
   test("cleanup non-shuffle files after executor exits when config " +
       "spark.storage.cleanupFilesAfterExecutorExit=true") {
     testCleanupFilesWithConfig(true)
@@ -248,17 +343,28 @@ class WorkerSuite extends SparkFunSuite with Matchers with BeforeAndAfter {
   }
 
   test("WorkDirCleanup cleans app dirs and shuffle metadata when " +
-    "spark.shuffle.service.db.enabled=true") {
-    testWorkDirCleanupAndRemoveMetadataWithConfig(true)
+    "spark.shuffle.service.db.enabled=true, spark.shuffle.service.db.backend=RocksDB") {
+    testWorkDirCleanupAndRemoveMetadataWithConfig(true, DBBackend.ROCKSDB)
   }
 
-  test("WorkdDirCleanup cleans only app dirs when" +
+  test("WorkDirCleanup cleans app dirs and shuffle metadata when " +
+    "spark.shuffle.service.db.enabled=true, spark.shuffle.service.db.backend=LevelDB") {
+    assume(!Utils.isMacOnAppleSilicon)
+    testWorkDirCleanupAndRemoveMetadataWithConfig(true, DBBackend.LEVELDB)
+  }
+
+  test("WorkDirCleanup cleans only app dirs when" +
     "spark.shuffle.service.db.enabled=false") {
     testWorkDirCleanupAndRemoveMetadataWithConfig(false)
   }
 
-  private def testWorkDirCleanupAndRemoveMetadataWithConfig(dbCleanupEnabled: Boolean): Unit = {
+  private def testWorkDirCleanupAndRemoveMetadataWithConfig(
+      dbCleanupEnabled: Boolean, shuffleDBBackend: DBBackend = null): Unit = {
     val conf = new SparkConf().set("spark.shuffle.service.db.enabled", dbCleanupEnabled.toString)
+    if (dbCleanupEnabled) {
+      assert(shuffleDBBackend != null)
+      conf.set(SHUFFLE_SERVICE_DB_BACKEND.key, shuffleDBBackend.name())
+    }
     conf.set("spark.worker.cleanup.appDataTtl", "60")
     conf.set("spark.shuffle.service.enabled", "true")
 
@@ -286,5 +392,17 @@ class WorkerSuite extends SparkFunSuite with Matchers with BeforeAndAfter {
       assert(!executorDir.exists())
       assert(cleanupCalled.get() == dbCleanupEnabled)
     }
+  }
+
+  test("SPARK-45867: Support worker id pattern") {
+    val worker = makeWorker(new SparkConf().set(WORKER_ID_PATTERN, "my-worker-%2$s"))
+    assert(worker.invokePrivate(_generateWorkerId()) === "my-worker-localhost")
+  }
+
+  test("SPARK-45867: Prevent invalid worker id patterns") {
+    val m = intercept[IllegalArgumentException] {
+      makeWorker(new SparkConf().set(WORKER_ID_PATTERN, "my worker"))
+    }.getMessage
+    assert(m.contains("Whitespace is not allowed"))
   }
 }

@@ -30,6 +30,8 @@ import com.fasterxml.jackson.databind.annotation.{JsonDeserialize, JsonSerialize
 import org.apache.spark.JobExecutionStatus
 import org.apache.spark.executor.ExecutorMetrics
 import org.apache.spark.metrics.ExecutorMetricType
+import org.apache.spark.resource.{ExecutorResourceRequest, ResourceInformation, TaskResourceRequest}
+import org.apache.spark.status.AppStatusUtils.getQuantilesValue
 
 case class ApplicationInfo private[spark](
     id: String,
@@ -38,7 +40,7 @@ case class ApplicationInfo private[spark](
     maxCores: Option[Int],
     coresPerExecutor: Option[Int],
     memoryPerExecutorMB: Option[Int],
-    attempts: Seq[ApplicationAttemptInfo])
+    attempts: collection.Seq[ApplicationAttemptInfo])
 
 @JsonIgnoreProperties(
   value = Array("startTimeEpoch", "endTimeEpoch", "lastUpdatedEpoch"),
@@ -61,6 +63,11 @@ case class ApplicationAttemptInfo private[spark](
 
 }
 
+class ResourceProfileInfo private[spark](
+    val id: Int,
+    val executorResources: Map[String, ExecutorResourceRequest],
+    val taskResources: Map[String, TaskResourceRequest])
+
 class ExecutorStageSummary private[spark](
     val taskTime : Long,
     val failedTasks : Int,
@@ -76,7 +83,19 @@ class ExecutorStageSummary private[spark](
     val shuffleWriteRecords : Long,
     val memoryBytesSpilled : Long,
     val diskBytesSpilled : Long,
-    val isBlacklistedForStage: Boolean)
+    @deprecated("use isExcludedForStage instead", "3.1.0")
+    val isBlacklistedForStage: Boolean,
+    @JsonSerialize(using = classOf[ExecutorMetricsJsonSerializer])
+    @JsonDeserialize(using = classOf[ExecutorMetricsJsonDeserializer])
+    val peakMemoryMetrics: Option[ExecutorMetrics],
+    val isExcludedForStage: Boolean)
+
+class SpeculationStageSummary private[spark](
+   val numTasks: Int,
+   val numActiveTasks: Int,
+   val numCompletedTasks: Int,
+   val numFailedTasks: Int,
+   val numKilledTasks: Int)
 
 class ExecutorSummary private[spark](
     val id: String,
@@ -96,6 +115,7 @@ class ExecutorSummary private[spark](
     val totalInputBytes: Long,
     val totalShuffleRead: Long,
     val totalShuffleWrite: Long,
+    @deprecated("use isExcluded instead", "3.1.0")
     val isBlacklisted: Boolean,
     val maxMemory: Long,
     val addTime: Date,
@@ -103,11 +123,16 @@ class ExecutorSummary private[spark](
     val removeReason: Option[String],
     val executorLogs: Map[String, String],
     val memoryMetrics: Option[MemoryMetrics],
+    @deprecated("use excludedInStages instead", "3.1.0")
     val blacklistedInStages: Set[Int],
     @JsonSerialize(using = classOf[ExecutorMetricsJsonSerializer])
     @JsonDeserialize(using = classOf[ExecutorMetricsJsonDeserializer])
     val peakMemoryMetrics: Option[ExecutorMetrics],
-    val attributes: Map[String, String])
+    val attributes: Map[String, String],
+    val resources: Map[String, ResourceInformation],
+    val resourceProfileId: Int,
+    val isExcluded: Boolean,
+    val excludedInStages: Set[Int])
 
 class MemoryMetrics private[spark](
     val usedOnHeapStorageMemory: Long,
@@ -125,6 +150,10 @@ private[spark] class ExecutorMetricsJsonDeserializer
       new TypeReference[Option[Map[String, java.lang.Long]]] {})
     metricsMap.map(metrics => new ExecutorMetrics(metrics))
   }
+
+  override def getNullValue(ctxt: DeserializationContext): Option[ExecutorMetrics] = {
+    None
+  }
 }
 /** serializer for peakMemoryMetrics: convert ExecutorMetrics to map with metric name as key */
 private[spark] class ExecutorMetricsJsonSerializer
@@ -133,16 +162,33 @@ private[spark] class ExecutorMetricsJsonSerializer
       metrics: Option[ExecutorMetrics],
       jsonGenerator: JsonGenerator,
       serializerProvider: SerializerProvider): Unit = {
-    metrics.foreach { m: ExecutorMetrics =>
-      val metricsMap = ExecutorMetricType.metricToOffset.map { case (metric, _) =>
-        metric -> m.getMetricValue(metric)
+    if (metrics.isEmpty) {
+      jsonGenerator.writeNull()
+    } else {
+      metrics.foreach { m: ExecutorMetrics =>
+        val metricsMap = ExecutorMetricType.metricToOffset.map { case (metric, _) =>
+          metric -> m.getMetricValue(metric)
+        }
+        jsonGenerator.writeObject(metricsMap)
       }
-      jsonGenerator.writeObject(metricsMap)
     }
   }
 
   override def isEmpty(provider: SerializerProvider, value: Option[ExecutorMetrics]): Boolean =
     value.isEmpty
+}
+
+private[spark] class ExecutorPeakMetricsDistributionsJsonSerializer
+  extends JsonSerializer[ExecutorPeakMetricsDistributions] {
+  override def serialize(
+    metrics: ExecutorPeakMetricsDistributions,
+    jsonGenerator: JsonGenerator,
+    serializerProvider: SerializerProvider): Unit = {
+    val metricsMap = ExecutorMetricType.metricToOffset.map { case (metric, _) =>
+      metric -> metrics.getMetricDistribution(metric)
+    }
+    jsonGenerator.writeObject(metricsMap)
+  }
 }
 
 class JobData private[spark](
@@ -151,8 +197,9 @@ class JobData private[spark](
     val description: Option[String],
     val submissionTime: Option[Date],
     val completionTime: Option[Date],
-    val stageIds: Seq[Int],
+    val stageIds: collection.Seq[Int],
     val jobGroup: Option[String],
+    val jobTags: collection.Seq[String],
     val status: JobExecutionStatus,
     val numTasks: Int,
     val numActiveTasks: Int,
@@ -175,8 +222,8 @@ class RDDStorageInfo private[spark](
     val storageLevel: String,
     val memoryUsed: Long,
     val diskUsed: Long,
-    val dataDistribution: Option[Seq[RDDDataDistribution]],
-    val partitions: Option[Seq[RDDPartitionInfo]])
+    val dataDistribution: Option[collection.Seq[RDDDataDistribution]],
+    val partitions: Option[collection.Seq[RDDPartitionInfo]])
 
 class RDDDataDistribution private[spark](
     val address: String,
@@ -197,7 +244,7 @@ class RDDPartitionInfo private[spark](
     val storageLevel: String,
     val memoryUsed: Long,
     val diskUsed: Long,
-    val executors: Seq[String])
+    val executors: collection.Seq[String])
 
 class StageData private[spark](
     val status: StageStatus,
@@ -237,6 +284,16 @@ class StageData private[spark](
     val shuffleLocalBytesRead: Long,
     val shuffleReadBytes: Long,
     val shuffleReadRecords: Long,
+    val shuffleCorruptMergedBlockChunks: Long,
+    val shuffleMergedFetchFallbackCount: Long,
+    val shuffleMergedRemoteBlocksFetched: Long,
+    val shuffleMergedLocalBlocksFetched: Long,
+    val shuffleMergedRemoteChunksFetched: Long,
+    val shuffleMergedLocalChunksFetched: Long,
+    val shuffleMergedRemoteBytesRead: Long,
+    val shuffleMergedLocalBytesRead: Long,
+    val shuffleRemoteReqsDuration: Long,
+    val shuffleMergedRemoteReqsDuration: Long,
     val shuffleWriteBytes: Long,
     val shuffleWriteTime: Long,
     val shuffleWriteRecords: Long,
@@ -246,16 +303,26 @@ class StageData private[spark](
     val details: String,
     val schedulingPool: String,
 
-    val rddIds: Seq[Int],
-    val accumulatorUpdates: Seq[AccumulableInfo],
+    val rddIds: collection.Seq[Int],
+    val accumulatorUpdates: collection.Seq[AccumulableInfo],
     val tasks: Option[Map[Long, TaskData]],
     val executorSummary: Option[Map[String, ExecutorStageSummary]],
-    val killedTasksSummary: Map[String, Int])
+    val speculationSummary: Option[SpeculationStageSummary],
+    val killedTasksSummary: Map[String, Int],
+    val resourceProfileId: Int,
+    @JsonSerialize(using = classOf[ExecutorMetricsJsonSerializer])
+    @JsonDeserialize(using = classOf[ExecutorMetricsJsonDeserializer])
+    val peakExecutorMetrics: Option[ExecutorMetrics],
+    val taskMetricsDistributions: Option[TaskMetricDistributions],
+    val executorMetricsDistributions: Option[ExecutorMetricsDistributions],
+    val isShufflePushEnabled: Boolean,
+    val shuffleMergersCount: Int)
 
 class TaskData private[spark](
     val taskId: Long,
     val index: Int,
     val attempt: Int,
+    val partitionId: Int,
     val launchTime: Date,
     val resultFetchStart: Option[Date],
     @JsonDeserialize(contentAs = classOf[JLong])
@@ -265,7 +332,7 @@ class TaskData private[spark](
     val status: String,
     val taskLocality: String,
     val speculative: Boolean,
-    val accumulatorUpdates: Seq[AccumulableInfo],
+    val accumulatorUpdates: collection.Seq[AccumulableInfo],
     val errorMessage: Option[String] = None,
     val taskMetrics: Option[TaskMetrics] = None,
     val executorLogs: Map[String, String],
@@ -296,6 +363,17 @@ class OutputMetrics private[spark](
     val bytesWritten: Long,
     val recordsWritten: Long)
 
+class ShufflePushReadMetrics private[spark](
+  val corruptMergedBlockChunks: Long,
+  val mergedFetchFallbackCount: Long,
+  val remoteMergedBlocksFetched: Long,
+  val localMergedBlocksFetched: Long,
+  val remoteMergedChunksFetched: Long,
+  val localMergedChunksFetched: Long,
+  val remoteMergedBytesRead: Long,
+  val localMergedBytesRead: Long,
+  val remoteMergedReqsDuration: Long)
+
 class ShuffleReadMetrics private[spark](
     val remoteBlocksFetched: Long,
     val localBlocksFetched: Long,
@@ -303,7 +381,9 @@ class ShuffleReadMetrics private[spark](
     val remoteBytesRead: Long,
     val remoteBytesReadToDisk: Long,
     val localBytesRead: Long,
-    val recordsRead: Long)
+    val recordsRead: Long,
+    val remoteReqsDuration: Long,
+    val shufflePushReadMetrics: ShufflePushReadMetrics)
 
 class ShuffleWriteMetrics private[spark](
     val bytesWritten: Long,
@@ -313,6 +393,7 @@ class ShuffleWriteMetrics private[spark](
 class TaskMetricDistributions private[spark](
     val quantiles: IndexedSeq[Double],
 
+    val duration: IndexedSeq[Double],
     val executorDeserializeTime: IndexedSeq[Double],
     val executorDeserializeCpuTime: IndexedSeq[Double],
     val executorRunTime: IndexedSeq[Double],
@@ -339,6 +420,50 @@ class OutputMetricDistributions private[spark](
     val bytesWritten: IndexedSeq[Double],
     val recordsWritten: IndexedSeq[Double])
 
+class ShufflePushReadMetricDistributions private[spark](
+  val corruptMergedBlockChunks: IndexedSeq[Double],
+  val mergedFetchFallbackCount: IndexedSeq[Double],
+  val remoteMergedBlocksFetched: IndexedSeq[Double],
+  val localMergedBlocksFetched: IndexedSeq[Double],
+  val remoteMergedChunksFetched: IndexedSeq[Double],
+  val localMergedChunksFetched: IndexedSeq[Double],
+  val remoteMergedBytesRead: IndexedSeq[Double],
+  val localMergedBytesRead: IndexedSeq[Double],
+  val remoteMergedReqsDuration: IndexedSeq[Double])
+
+class ExecutorMetricsDistributions private[spark](
+  val quantiles: IndexedSeq[Double],
+
+  val taskTime: IndexedSeq[Double],
+  val failedTasks: IndexedSeq[Double],
+  val succeededTasks: IndexedSeq[Double],
+  val killedTasks: IndexedSeq[Double],
+  val inputBytes: IndexedSeq[Double],
+  val inputRecords: IndexedSeq[Double],
+  val outputBytes: IndexedSeq[Double],
+  val outputRecords: IndexedSeq[Double],
+  val shuffleRead: IndexedSeq[Double],
+  val shuffleReadRecords: IndexedSeq[Double],
+  val shuffleWrite: IndexedSeq[Double],
+  val shuffleWriteRecords: IndexedSeq[Double],
+  val memoryBytesSpilled: IndexedSeq[Double],
+  val diskBytesSpilled: IndexedSeq[Double],
+  @JsonSerialize(using = classOf[ExecutorPeakMetricsDistributionsJsonSerializer])
+  val peakMemoryMetrics: ExecutorPeakMetricsDistributions
+)
+
+@JsonSerialize(using = classOf[ExecutorPeakMetricsDistributionsJsonSerializer])
+class ExecutorPeakMetricsDistributions private[spark](
+  val quantiles: IndexedSeq[Double],
+  val executorMetrics: IndexedSeq[ExecutorMetrics]) {
+
+  /** Returns the distributions for the specified metric. */
+  def getMetricDistribution(metricName: String): IndexedSeq[Double] = {
+    val sorted = executorMetrics.map(_.getMetricValue(metricName).toDouble).sorted
+    getQuantilesValue(sorted, quantiles.toArray)
+  }
+}
+
 class ShuffleReadMetricDistributions private[spark](
     val readBytes: IndexedSeq[Double],
     val readRecords: IndexedSeq[Double],
@@ -347,7 +472,9 @@ class ShuffleReadMetricDistributions private[spark](
     val fetchWaitTime: IndexedSeq[Double],
     val remoteBytesRead: IndexedSeq[Double],
     val remoteBytesReadToDisk: IndexedSeq[Double],
-    val totalBlocksFetched: IndexedSeq[Double])
+    val totalBlocksFetched: IndexedSeq[Double],
+    val remoteReqsDuration: IndexedSeq[Double],
+    val shufflePushReadMetricsDist: ShufflePushReadMetricDistributions)
 
 class ShuffleWriteMetricDistributions private[spark](
     val writeBytes: IndexedSeq[Double],
@@ -363,12 +490,16 @@ class AccumulableInfo private[spark](
 class VersionInfo private[spark](
   val spark: String)
 
+// Note the resourceProfiles information are only added here on return from the
+// REST call, they are not stored with it.
 class ApplicationEnvironmentInfo private[spark] (
     val runtime: RuntimeInfo,
-    val sparkProperties: Seq[(String, String)],
-    val hadoopProperties: Seq[(String, String)],
-    val systemProperties: Seq[(String, String)],
-    val classpathEntries: Seq[(String, String)])
+    val sparkProperties: collection.Seq[(String, String)],
+    val hadoopProperties: collection.Seq[(String, String)],
+    val systemProperties: collection.Seq[(String, String)],
+    val metricsProperties: collection.Seq[(String, String)],
+    val classpathEntries: collection.Seq[(String, String)],
+    val resourceProfiles: collection.Seq[ResourceProfileInfo])
 
 class RuntimeInfo private[spark](
     val javaVersion: String,
@@ -379,7 +510,7 @@ case class StackTrace(elems: Seq[String]) {
   override def toString: String = elems.mkString
 
   def html: NodeSeq = {
-    val withNewLine = elems.foldLeft(NodeSeq.Empty) { (acc, elem) =>
+    val withNewLine = elems.map(_.stripLineEnd).foldLeft(NodeSeq.Empty) { (acc, elem) =>
       if (acc.isEmpty) {
         acc :+ Text(elem)
       } else {
@@ -396,10 +527,59 @@ case class StackTrace(elems: Seq[String]) {
 }
 
 case class ThreadStackTrace(
-    val threadId: Long,
-    val threadName: String,
-    val threadState: Thread.State,
-    val stackTrace: StackTrace,
-    val blockedByThreadId: Option[Long],
-    val blockedByLock: String,
-    val holdingLocks: Seq[String])
+    threadId: Long,
+    threadName: String,
+    threadState: Thread.State,
+    stackTrace: StackTrace,
+    blockedByThreadId: Option[Long],
+    blockedByLock: String,
+    @deprecated("using synchronizers and monitors instead", "4.0.0")
+    holdingLocks: Seq[String],
+    synchronizers: Seq[String],
+    monitors: Seq[String],
+    lockName: Option[String],
+    lockOwnerName: Option[String],
+    suspended: Boolean,
+    inNative: Boolean,
+    isDaemon: Boolean,
+    priority: Int) {
+
+  /**
+   * Returns a string representation of this thread stack trace
+   * w.r.t java.lang.management.ThreadInfo(JDK 8)'s toString.
+   *
+   * TODO(SPARK-44896): Also considering adding information os_prio, cpu, elapsed, tid, nid, etc.,
+   *   from the jstack tool
+   */
+  override def toString: String = {
+    val daemon = if (isDaemon) " daemon" else ""
+    val sb = new StringBuilder(
+      s""""$threadName"$daemon prio=$priority Id=$threadId $threadState""")
+    lockName.foreach(lock => sb.append(s" on $lock"))
+    lockOwnerName.foreach {
+      owner => sb.append(s"""owned by "$owner"""")
+    }
+    blockedByThreadId.foreach(id => s" Id=$id")
+    if (suspended) sb.append(" (suspended)")
+    if (inNative) sb.append(" (in native)")
+    sb.append('\n')
+
+    sb.append(stackTrace.elems.map(e => s"\tat $e").mkString)
+
+    if (synchronizers.nonEmpty) {
+      sb.append(s"\n\tNumber of locked synchronizers = ${synchronizers.length}\n")
+      synchronizers.foreach(sync => sb.append(s"\t- $sync\n"))
+    }
+    sb.append('\n')
+    sb.toString
+  }
+}
+
+class ProcessSummary private[spark](
+     val id: String,
+     val hostPort: String,
+     val isActive: Boolean,
+     val totalCores: Int,
+     val addTime: Date,
+     val removeTime: Option[Date],
+     val processLogs: Map[String, String])

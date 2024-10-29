@@ -19,16 +19,15 @@ package org.apache.spark.ml.source.image
 
 import com.google.common.io.{ByteStreams, Closeables}
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.hadoop.fs.FileStatus
 import org.apache.hadoop.mapreduce.Job
 
 import org.apache.spark.ml.image.ImageSchema
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.encoders.RowEncoder
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, UnsafeRow}
-import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
-import org.apache.spark.sql.execution.datasources.{DataSource, FileFormat, OutputWriterFactory, PartitionedFile}
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+import org.apache.spark.sql.catalyst.expressions.UnsafeRow
+import org.apache.spark.sql.execution.datasources.{FileFormat, OutputWriterFactory, PartitionedFile}
 import org.apache.spark.sql.sources.{DataSourceRegister, Filter}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.SerializableConfiguration
@@ -72,8 +71,8 @@ private[image] class ImageFileFormat extends FileFormat with DataSourceRegister 
       if (!imageSourceOptions.dropInvalid && requiredSchema.isEmpty) {
         Iterator(emptyUnsafeRow)
       } else {
-        val origin = file.filePath
-        val path = new Path(origin)
+        val origin = file.urlEncodedPath
+        val path = file.toPath
         val fs = path.getFileSystem(broadcastedHadoopConf.value.value)
         val stream = fs.open(path)
         val bytes = try {
@@ -83,7 +82,7 @@ private[image] class ImageFileFormat extends FileFormat with DataSourceRegister 
         }
         val resultOpt = ImageSchema.decode(origin, bytes)
         val filteredResult = if (imageSourceOptions.dropInvalid) {
-          resultOpt.toIterator
+          resultOpt.iterator
         } else {
           Iterator(resultOpt.getOrElse(ImageSchema.invalidImageRow(origin)))
         }
@@ -91,8 +90,8 @@ private[image] class ImageFileFormat extends FileFormat with DataSourceRegister 
         if (requiredSchema.isEmpty) {
           filteredResult.map(_ => emptyUnsafeRow)
         } else {
-          val converter = RowEncoder(requiredSchema)
-          filteredResult.map(row => converter.toRow(row))
+          val toRow = ExpressionEncoder(requiredSchema).createSerializer()
+          filteredResult.map(row => toRow(row))
         }
       }
     }

@@ -18,17 +18,19 @@
 package org.apache.spark.deploy
 
 import java.io._
-import java.net.URL
+import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeoutException
 
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.{Future, Promise}
+// scalastyle:off executioncontextglobal
 import scala.concurrent.ExecutionContext.Implicits.global
+// scalastyle:on executioncontextglobal
 import scala.concurrent.duration._
 import scala.sys.process._
 
-import org.json4s._
+import org.json4s.Formats
 import org.json4s.jackson.JsonMethods
 
 import org.apache.spark.{SparkConf, SparkContext}
@@ -78,7 +80,7 @@ private object FaultToleranceTest extends App with Logging {
 
   System.setProperty(config.DRIVER_HOST_ADDRESS.key, "172.17.42.1") // default docker host ip
 
-  private def afterEach() {
+  private def afterEach(): Unit = {
     if (sc != null) {
       sc.stop()
       sc = null
@@ -180,7 +182,7 @@ private object FaultToleranceTest extends App with Logging {
     }
   }
 
-  private def test(name: String)(fn: => Unit) {
+  private def test(name: String)(fn: => Unit): Unit = {
     try {
       fn
       numPassed += 1
@@ -198,14 +200,14 @@ private object FaultToleranceTest extends App with Logging {
     afterEach()
   }
 
-  private def addMasters(num: Int) {
+  private def addMasters(num: Int): Unit = {
     logInfo(s">>>>> ADD MASTERS $num <<<<<")
     (1 to num).foreach { _ => masters += SparkDocker.startMaster(dockerMountDir) }
   }
 
-  private def addWorkers(num: Int) {
+  private def addWorkers(num: Int): Unit = {
     logInfo(s">>>>> ADD WORKERS $num <<<<<")
-    val masterUrls = getMasterUrls(masters)
+    val masterUrls = getMasterUrls(masters.toSeq)
     (1 to num).foreach { _ => workers += SparkDocker.startWorker(dockerMountDir, masterUrls) }
   }
 
@@ -216,7 +218,7 @@ private object FaultToleranceTest extends App with Logging {
     // Counter-hack: Because of a hack in SparkEnv#create() that changes this
     // property, we need to reset it.
     System.setProperty(config.DRIVER_PORT.key, "0")
-    sc = new SparkContext(getMasterUrls(masters), "fault-tolerance", containerSparkHome)
+    sc = new SparkContext(getMasterUrls(masters.toSeq), "fault-tolerance", containerSparkHome)
   }
 
   private def getMasterUrls(masters: Seq[TestMasterInfo]): String = {
@@ -239,7 +241,7 @@ private object FaultToleranceTest extends App with Logging {
 
   private def delay(secs: Duration = 5.seconds) = Thread.sleep(secs.toMillis)
 
-  private def terminateCluster() {
+  private def terminateCluster(): Unit = {
     logInfo(">>>>> TERMINATE CLUSTER <<<<<")
     masters.foreach(_.kill())
     workers.foreach(_.kill())
@@ -279,7 +281,7 @@ private object FaultToleranceTest extends App with Logging {
     var liveWorkerIPs: Seq[String] = List()
 
     def stateValid(): Boolean = {
-      (workers.map(_.ip) -- liveWorkerIPs).isEmpty &&
+      workers.map(_.ip).forall(liveWorkerIPs.contains) &&
         numAlive == 1 && numStandby == masters.size - 1 && numLiveApps >= 1
     }
 
@@ -326,7 +328,7 @@ private object FaultToleranceTest extends App with Logging {
     }
   }
 
-  private def assertTrue(bool: Boolean, message: String = "") {
+  private def assertTrue(bool: Boolean, message: String = ""): Unit = {
     if (!bool) {
       throw new IllegalStateException("Assertion failed: " + message)
     }
@@ -339,17 +341,17 @@ private object FaultToleranceTest extends App with Logging {
 private class TestMasterInfo(val ip: String, val dockerId: DockerId, val logFile: File)
   extends Logging  {
 
-  implicit val formats = org.json4s.DefaultFormats
+  implicit val formats: Formats = org.json4s.DefaultFormats
   var state: RecoveryState.Value = _
   var liveWorkerIPs: List[String] = _
   var numLiveApps = 0
 
   logDebug("Created master: " + this)
 
-  def readState() {
+  def readState(): Unit = {
     try {
       val masterStream = new InputStreamReader(
-        new URL("http://%s:8080/json".format(ip)).openStream, StandardCharsets.UTF_8)
+        new URI("http://%s:8080/json".format(ip)).toURL.openStream, StandardCharsets.UTF_8)
       val json = JsonMethods.parse(masterStream)
 
       val workers = json \ "workers"
@@ -372,7 +374,7 @@ private class TestMasterInfo(val ip: String, val dockerId: DockerId, val logFile
     }
   }
 
-  def kill() { Docker.kill(dockerId) }
+  def kill(): Unit = { Docker.kill(dockerId) }
 
   override def toString: String =
     "[ip=%s, id=%s, logFile=%s, state=%s]".
@@ -382,11 +384,11 @@ private class TestMasterInfo(val ip: String, val dockerId: DockerId, val logFile
 private class TestWorkerInfo(val ip: String, val dockerId: DockerId, val logFile: File)
   extends Logging {
 
-  implicit val formats = org.json4s.DefaultFormats
+  implicit val formats: Formats = org.json4s.DefaultFormats
 
   logDebug("Created worker: " + this)
 
-  def kill() { Docker.kill(dockerId) }
+  def kill(): Unit = { Docker.kill(dockerId) }
 
   override def toString: String =
     "[ip=%s, id=%s, logFile=%s]".format(ip, dockerId, logFile.getAbsolutePath)

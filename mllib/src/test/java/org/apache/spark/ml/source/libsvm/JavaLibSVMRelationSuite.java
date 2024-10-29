@@ -23,8 +23,9 @@ import java.nio.charset.StandardCharsets;
 
 import com.google.common.io.Files;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import org.apache.spark.SharedSparkSession;
 import org.apache.spark.ml.linalg.DenseVector;
@@ -43,12 +44,13 @@ public class JavaLibSVMRelationSuite extends SharedSparkSession {
   private String path;
 
   @Override
+  @BeforeEach
   public void setUp() throws IOException {
     super.setUp();
     tempDir = Utils.createTempDir(System.getProperty("java.io.tmpdir"), "datasource");
     File file = new File(tempDir, "part-00000");
     String s = "1 1:1.0 3:2.0 5:3.0\n0\n0 2:4.0 4:5.0 6:6.0";
-    Files.write(s, file, StandardCharsets.UTF_8);
+    Files.asCharSink(file, StandardCharsets.UTF_8).write(s);
     path = tempDir.toURI().toString();
   }
 
@@ -62,11 +64,11 @@ public class JavaLibSVMRelationSuite extends SharedSparkSession {
   public void verifyLibSVMDF() {
     Dataset<Row> dataset = spark.read().format("libsvm").option("vectorType", "dense")
       .load(path);
-    Assert.assertEquals("label", dataset.columns()[0]);
-    Assert.assertEquals("features", dataset.columns()[1]);
+    Assertions.assertEquals("label", dataset.columns()[0]);
+    Assertions.assertEquals("features", dataset.columns()[1]);
     Row r = dataset.first();
-    Assert.assertEquals(1.0, r.getDouble(0), 1e-15);
+    Assertions.assertEquals(1.0, r.getDouble(0), 1e-15);
     DenseVector v = r.getAs(1);
-    Assert.assertEquals(Vectors.dense(1.0, 0.0, 2.0, 0.0, 3.0, 0.0), v);
+    Assertions.assertEquals(Vectors.dense(1.0, 0.0, 2.0, 0.0, 3.0, 0.0), v);
   }
 }
